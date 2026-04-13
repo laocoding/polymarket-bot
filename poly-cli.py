@@ -680,20 +680,46 @@ def btc_watch():
 @click.option('--bet-size', default=None, type=float, help='Bet size in USD (default from config)')
 @click.option('--auto-claim', is_flag=True, default=None, help='Auto claim winnings after market resolves')
 @click.option('--stop-loss', default=None, type=float, help='Stop loss percentage (default from config)')
-def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss):
+@click.option('--paper', is_flag=True, default=False, help='Paper trading mode - simulate orders, save ticks & journal')
+def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, paper):
     """Watch BTC prices and place bid when conditions are met
-    
-    Options can be set via config.json or command line
+
+    Options can be set via config.json or command line.
+    Use --paper for paper trading (no real orders, saves data for analysis).
     """
     import subprocess
     import re
+    import logging
     from datetime import datetime, timezone
     import time
-    
+
+    # Setup file logging - one file per day, auto-rotates at midnight
+    log_dir = Path(__file__).parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+    log_file = log_dir / f"bot_{datetime.now().strftime('%Y%m%d')}.log"
+    bot_logger = logging.getLogger("bot")
+    bot_logger.setLevel(logging.INFO)
+    # Remove any stale handlers from previous runs
+    bot_logger.handlers.clear()
+    from logging.handlers import TimedRotatingFileHandler
+    file_handler = TimedRotatingFileHandler(
+        log_file, when="midnight", backupCount=30, encoding="utf-8"
+    )
+    file_handler.suffix = "%Y%m%d"
+    file_handler.namer = lambda name: str(log_dir / f"bot_{name.split('.')[-1]}.log")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    bot_logger.addHandler(file_handler)
+
+    def bot_log(msg, echo=True):
+        """Log to file and optionally print to console."""
+        bot_logger.info(msg)
+        if echo:
+            click.echo(msg)
+
     # Load config for default values
     config = load_config()
     btc_config = config.get('btc_watch_order', {})
-    
+
     # Use command line args if provided, otherwise use config
     bid_price = bid_price if bid_price is not None else btc_config.get('bid_price', 0.9)
     min_duration = min_duration if min_duration is not None else btc_config.get('min_duration', 5)
@@ -702,11 +728,149 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss):
     stop_loss_percent = stop_loss if stop_loss is not None else btc_config.get('stop_loss_percent', 45)
     sl_min_duration = config.get('sl_min_duration', 5)  # Read from root level
     time_buffer = btc_config.get('time_buffer', 15)
-    import subprocess
-    import re
-    from datetime import datetime, timezone
-    import time
-    
+
+    # Paper trading: tick data and journal
+    paper_ticks = []  # Collected tick data
+    paper_trades = []  # Simulated trades
+    paper_ticks_file = Path(__file__).parent / "backtest" / "ticks.json"
+    paper_journal_file = Path(__file__).parent / "trades.json"
+
+    def save_tick(slug, up_price, down_price, timestamp_str):
+        """Save a tick data point for paper trading analysis."""
+        if not paper:
+            return
+        tick = {
+            "timestamp": timestamp_str,
+            "slug": slug,
+            "up_price": round(up_price, 4),
+            "down_price": round(down_price, 4),
+        }
+        paper_ticks.append(tick)
+        # Write every 30 ticks (~1 minute) to avoid data loss
+        if len(paper_ticks) % 30 == 0:
+            flush_ticks()
+
+    def flush_ticks():
+        """Write accumulated ticks to file."""
+        if not paper_ticks:
+            return
+        paper_ticks_file.parent.mkdir(parents=True, exist_ok=True)
+        # Append to existing ticks
+        existing = []
+        if paper_ticks_file.exists():
+            try:
+                with open(paper_ticks_file, 'r') as f:
+                    existing = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                existing = []
+        existing.extend(paper_ticks)
+        with open(paper_ticks_file, 'w') as f:
+            json.dump(existing, f, indent=2)
+        paper_ticks.clear()
+
+    def paper_log_trade(slug, side, entry_price, bet_size):
+        """Log a simulated trade."""
+        trade = {
+            "id": len(paper_trades) + 1,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "slug": slug,
+            "side": side,
+            "entry_price": entry_price,
+            "bet_size": bet_size,
+            "status": "open",
+            "exit_price": None,
+            "pnl": None,
+            "exit_reason": None,
+            "mode": "paper",
+        }
+        paper_trades.append(trade)
+        save_journal()
+        return trade["id"]
+
+    def paper_close_trade(slug, exit_price, exit_reason="resolved"):
+        """Close a simulated trade."""
+        for trade in reversed(paper_trades):
+            if trade["slug"] == slug and trade["status"] == "open":
+                trade["status"] = "closed"
+                trade["exit_price"] = exit_price
+                trade["exit_reason"] = exit_reason
+                trade["exit_timestamp"] = datetime.now(timezone.utc).isoformat()
+                if exit_price >= 0.99:  # Won
+                    trade["pnl"] = round((1.0 - trade["entry_price"]) * trade["bet_size"], 2)
+                elif exit_price <= 0.01:  # Lost
+                    trade["pnl"] = round(-trade["entry_price"] * trade["bet_size"], 2)
+                else:  # Stop-loss
+                    trade["pnl"] = round((exit_price - trade["entry_price"]) * trade["bet_size"], 2)
+                save_journal()
+                return trade
+        return None
+
+    def save_journal():
+        """Save paper trades to journal file."""
+        # Load existing trades from previous sessions (different IDs)
+        existing_trades = []
+        current_ids = {t["id"] for t in paper_trades}
+        if paper_journal_file.exists():
+            try:
+                with open(paper_journal_file, 'r') as f:
+                    data = json.load(f)
+                    existing_trades = [t for t in data.get("trades", []) if t.get("id") not in current_ids]
+            except (json.JSONDecodeError, IOError):
+                pass
+        all_trades = existing_trades + paper_trades
+        with open(paper_journal_file, 'w') as f:
+            json.dump({"trades": all_trades, "mode": "paper"}, f, indent=2)
+
+    def print_paper_summary():
+        """Print paper trading performance summary."""
+        if not paper_trades:
+            click.echo("\n📋 No paper trades recorded.")
+            return
+
+        closed = [t for t in paper_trades if t["status"] == "closed"]
+        open_trades = [t for t in paper_trades if t["status"] == "open"]
+
+        click.echo(f"\n{'='*60}")
+        click.echo(f"📋 PAPER TRADING SUMMARY")
+        click.echo(f"{'='*60}")
+        click.echo(f"Total trades: {len(paper_trades)} (Closed: {len(closed)}, Open: {len(open_trades)})")
+        click.echo(f"Ticks collected: {len(paper_ticks)}")
+
+        if closed:
+            wins = [t for t in closed if (t.get("pnl") or 0) > 0]
+            losses = [t for t in closed if (t.get("pnl") or 0) < 0]
+            total_pnl = sum(t.get("pnl", 0) for t in closed)
+            win_rate = len(wins) / len(closed) * 100 if closed else 0
+
+            click.echo(f"\nWins: {len(wins)}  Losses: {len(losses)}")
+            click.echo(f"Win Rate: {win_rate:.1f}%")
+            click.echo(f"Total P&L: ${total_pnl:+.2f}")
+
+            if wins:
+                click.echo(f"Avg Win: ${sum(t['pnl'] for t in wins)/len(wins):+.2f}")
+            if losses:
+                click.echo(f"Avg Loss: ${sum(t['pnl'] for t in losses)/len(losses):+.2f}")
+
+            # Breakeven analysis
+            breakeven_wr = bid_price * 100
+            click.echo(f"\nBreakeven WR needed: {breakeven_wr:.0f}%")
+            click.echo(f"Actual WR: {win_rate:.1f}%")
+            if win_rate > breakeven_wr:
+                click.echo(f"Edge: +{win_rate - breakeven_wr:.1f}% -> PROFITABLE signal")
+            else:
+                click.echo(f"Edge: {win_rate - breakeven_wr:.1f}% -> NOT profitable")
+
+            click.echo(f"\nTrades:")
+            for t in closed[-10:]:
+                result = "W" if (t.get("pnl") or 0) > 0 else "L"
+                click.echo(f"  {result} {t['side']:>4} @ ${t['entry_price']:.2f} "
+                          f"-> exit ${t.get('exit_price', 0):.2f} "
+                          f"P&L=${t.get('pnl', 0):+.2f} ({t.get('exit_reason', '')})")
+
+        click.echo(f"\nData saved to:")
+        click.echo(f"  Ticks: {paper_ticks_file}")
+        click.echo(f"  Journal: {paper_journal_file}")
+
     try:
         from py_clob_client.client import ClobClient
         from py_clob_client.clob_types import OrderArgs, OrderType
@@ -737,29 +901,37 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss):
                 # ถ้าเช็คไม่ได้ ให้ถือว่ามี position (ปลอดภัย)
                 return True, float(bet_size)
         
-        click.echo(f"📊 Watching BTC Up/Down with auto-order... (Press Ctrl+C to stop)")
-        click.echo(f"   Bid threshold: > ${bid_price} for {min_duration} seconds")
-        click.echo(f"   Bet size: ${bet_size}")
-        click.echo(f"   Auto-claim: {'Enabled' if auto_claim else 'Disabled'}")
+        mode_label = "📝 PAPER MODE" if paper else "💰 LIVE MODE"
+        bot_log(f"📊 Watching BTC Up/Down with auto-order... (Press Ctrl+C to stop)")
+        bot_log(f"   Mode: {mode_label}")
+        bot_log(f"   Bid threshold: > ${bid_price} for {min_duration} seconds")
+        bot_log(f"   Bet size: ${bet_size}")
+        bot_log(f"   Stop loss: {stop_loss_percent}% (min duration: {sl_min_duration}s)")
+        bot_log(f"   Auto-claim: {'Enabled' if auto_claim else 'Disabled'}")
+        bot_log(f"   Log file: {log_file}")
         click.echo("-" * 60)
         
         # Initialize client
         config = load_config()
-        client = ClobClient(
-            config.get("host", "https://clob.polymarket.com"),
-            key=config["private_key"],
-            chain_id=config.get("chain_id", 137),
-            signature_type=config.get("signature_type", 0),
-            funder=config.get("funder", "")
-        )
-        
-        # Create API creds
-        try:
-            creds = client.create_or_derive_api_creds()
-            client.set_api_creds(creds)
-            click.echo("✅ API credentials ready")
-        except Exception as e:
-            click.echo(f"⚠️ API creds error: {e}")
+        if paper and not config.get("private_key"):
+            # Paper mode: read-only client for price data
+            client = ClobClient(config.get("host", "https://clob.polymarket.com"))
+            click.echo("📝 Paper mode: read-only client (no private key needed)")
+        else:
+            client = ClobClient(
+                config.get("host", "https://clob.polymarket.com"),
+                key=config["private_key"],
+                chain_id=config.get("chain_id", 137),
+                signature_type=config.get("signature_type", 0),
+                funder=config.get("funder", "")
+            )
+            # Create API creds
+            try:
+                creds = client.create_or_derive_api_creds()
+                client.set_api_creds(creds)
+                click.echo("✅ API credentials ready")
+            except Exception as e:
+                click.echo(f"⚠️ API creds error: {e}")
         
         # Get first market info
         click.echo("🔄 Loading market info...")
@@ -791,6 +963,8 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss):
         bought_token = None
         last_displayed_slug = None
         use_gamma_prices = False  # Flag to use Gamma API prices
+        title = ""  # Initialize title to avoid NameError
+        token_ids = []  # Initialize token_ids
         # Stop loss tracking
         entry_price = None
         entry_side = None
@@ -840,8 +1014,10 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss):
                             
                             # Get prices from outcomePrices
                             outcome_prices = market_data.get('outcomePrices', '[]')
-                            import json as json_module
-                            prices = json_module.loads(outcome_prices)
+                            if isinstance(outcome_prices, str):
+                                prices = json.loads(outcome_prices)
+                            else:
+                                prices = outcome_prices if outcome_prices else []
                             
                             # Use lastTradePrice or bestBid/bestAsk for real prices
                             last_price = market_data.get('lastTradePrice')
@@ -850,7 +1026,10 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss):
                             
                             # Get token IDs for CLOB prices
                             clob_token_ids = market_data.get('clobTokenIds', '[]')
-                            token_ids = json_module.loads(clob_token_ids) if clob_token_ids else []
+                            if isinstance(clob_token_ids, str):
+                                token_ids = json.loads(clob_token_ids) if clob_token_ids else []
+                            else:
+                                token_ids = clob_token_ids if clob_token_ids else []
                             
                             # Try CLOB first for real-time prices
                             use_clob_prices = False
@@ -899,7 +1078,7 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss):
                             time.sleep(3)
                             continue
                     except Exception as e:
-                        click.echo(f"   ⚠️ Gamma API error: {e}")
+                        bot_log(f"   ⚠️ Gamma API error: {e}")
                         time.sleep(3)
                         continue
                 else:
@@ -924,18 +1103,80 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss):
                         click.echo(f"▶️ Resuming...")
                 
                 # Check if market resolved (compare with last displayed)
-                if order_placed and bought_token and last_displayed_slug:
-                    if current_slug != last_displayed_slug:
-                        # New market - check if old market resolved
-                        click.echo(f"\n🔄 Market changed from {last_displayed_slug} to {current_slug}")
-                        
-                        # Check if there's an unfilled order from previous market
+                # Use entry_market_slug to detect we had a position, even if stop-loss already reset order_placed
+                had_position = (order_placed and bought_token) or entry_market_slug is not None
+                if had_position and last_displayed_slug and current_slug != last_displayed_slug:
+                    # Save entry info before resolution check (stop-loss may have cleared these)
+                    resolve_side = entry_side
+                    resolve_entry_price = entry_price
+                    # New market - check if old market resolved
+                    bot_log(f"\n🔄 Market changed from {last_displayed_slug} to {current_slug}")
+
+                    if paper:
+                        # Check if trade was already closed by stop-loss
+                        has_open_trade = any(
+                            t["slug"] == last_displayed_slug and t["status"] == "open"
+                            for t in paper_trades
+                        )
+                        if has_open_trade and resolve_side:
+                            # Paper mode: check resolution via Gamma API (retry up to 3 times)
+                            paper_resolved = False
+                            for _retry in range(3):
+                                try:
+                                    import requests as req
+                                    resp = req.get(
+                                        f'https://gamma-api.polymarket.com/markets?slug={last_displayed_slug}',
+                                        timeout=10
+                                    )
+                                    if resp.status_code == 200 and resp.json():
+                                        mdata = resp.json()[0]
+                                        outcome_prices_raw = mdata.get('outcomePrices', '[]')
+                                        if isinstance(outcome_prices_raw, str):
+                                            op = json.loads(outcome_prices_raw)
+                                        else:
+                                            op = outcome_prices_raw
+
+                                        if len(op) >= 2:
+                                            up_final = float(op[0])
+                                            down_final = float(op[1])
+                                            if up_final >= 0.99:
+                                                winner = "UP"
+                                            elif down_final >= 0.99:
+                                                winner = "DOWN"
+                                            else:
+                                                winner = None
+
+                                            if winner:
+                                                won = (resolve_side == winner)
+                                                exit_price = 1.0 if won else 0.0
+                                                paper_close_trade(last_displayed_slug, exit_price, "resolved")
+                                                result_emoji = "🎉 WON" if won else "💸 LOST"
+                                                pnl = ((1.0 - resolve_entry_price) if won else (-resolve_entry_price)) * bet_size
+                                                bot_log(f"   📝 PAPER RESULT: {result_emoji} | {resolve_side} | P&L: ${pnl:+.2f}")
+                                                paper_resolved = True
+                                                break
+                                            else:
+                                                click.echo(f"   ⏳ Market not resolved yet, retrying ({_retry+1}/3)...")
+                                                time.sleep(3)
+                                    else:
+                                        click.echo(f"   ⚠️ Could not fetch resolution for {last_displayed_slug}")
+                                        time.sleep(2)
+                                except Exception as e:
+                                    click.echo(f"   ⚠️ Paper resolution check error: {e}")
+                                    time.sleep(2)
+                            if not paper_resolved:
+                                # Close as unknown - don't lose the trade
+                                paper_close_trade(last_displayed_slug, 0.5, "unresolved")
+                                bot_log(f"   ⚠️ Could not resolve {last_displayed_slug} - closed as unresolved")
+                        elif not has_open_trade:
+                            bot_log(f"   ℹ️ Trade already closed (stop-loss) for {last_displayed_slug}", echo=False)
+                    else:
+                        # Live mode: check unfilled orders
                         if order_placed and bought_token:
                             try:
-                                # Get open orders
                                 open_orders = client.get_orders()
                                 unfilled_orders = [o for o in open_orders if o.get('token_id') == bought_token]
-                                
+
                                 if unfilled_orders:
                                     click.echo(f"⚠️ Found unfilled order, canceling...")
                                     for oo in unfilled_orders:
@@ -952,78 +1193,60 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss):
                                     click.echo(f"   ✅ Order was filled (no open orders)")
                             except Exception as e:
                                 click.echo(f"⚠️ Check/cancel error: {e}")
-                        
-                        # Check if we won
-                        if auto_claim:
+
+                        # Check if we won (live mode auto-claim)
+                        if auto_claim and not paper:
                             try:
-                                # Get condition ID from market
                                 condition_match = re.search(r'"conditionId":"([^"]+)"', html)
                                 if condition_match:
                                     condition_id = condition_match.group(1)
                                     click.echo(f"   Condition ID: {condition_id[:20]}...")
-                                    
-                                    # Check if market is resolved first
-                                    # Get the closed status from market
-                                    import json
                                     resp = requests.get(
-                
                                         f'https://gamma-api.polymarket.com/markets?conditionId={condition_id}',
                                         timeout=30
                                     )
-                                    
                                     market_resolved = False
                                     winning_outcome = None
-                                    
                                     if resp.status_code == 200 and resp.json():
                                         market_data = resp.json()
                                         if market_data and len(market_data) > 0:
                                             market_resolved = market_data[0].get('resolved', False)
                                             outcome_prices = market_data[0].get('outcomePrices', [])
-                                            
-                                            # Determine winning outcome
                                             if outcome_prices and len(outcome_prices) >= 2:
                                                 if float(outcome_prices[0]) == 1.0:
                                                     winning_outcome = "Yes"
                                                 elif float(outcome_prices[1]) == 1.0:
                                                     winning_outcome = "No"
-                                    
                                     click.echo(f"   Market Resolved: {market_resolved}")
                                     click.echo(f"   Winning Outcome: {winning_outcome}")
-                                    
                                     if not market_resolved:
                                         click.echo(f"   ⏳ Market not resolved yet, skipping claim...")
                                     else:
-                                        # Get wallet and config
                                         config = load_config()
                                         rpc_url = config.get('rpc', 'https://polygon.drpc.org')
-                                        
-                                        # Use correct wallet derived from private key
                                         from eth_account import Account
                                         account = Account.from_key(config.get('private_key'))
                                         wallet = account.address
                                         private_key = config.get('private_key')
-                                        
-                                        # Try to claim
                                         click.echo(f"🔄 Attempting auto-claim from {wallet[:10]}...")
                                         result = auto_claim_tokens(condition_id, wallet, rpc_url, private_key)
-                                    
-                                    if result.get('success'):
-                                        click.echo(f"   ✅ Claimed! TX: {result.get('tx_hash', '')[:20]}...")
-                                    else:
-                                        click.echo(f"   ❌ Claim failed: {result.get('error', 'Unknown')}")
-                                        click.echo(f"   💡 Please claim manually via Polymarket UI")
+                                        if result.get('success'):
+                                            click.echo(f"   ✅ Claimed! TX: {result.get('tx_hash', '')[:20]}...")
+                                        else:
+                                            click.echo(f"   ❌ Claim failed: {result.get('error', 'Unknown')}")
+                                            click.echo(f"   💡 Please claim manually via Polymarket UI")
                                 else:
                                     click.echo(f"⚠️ Could not find condition ID for claiming")
                             except Exception as e:
                                 click.echo(f"⚠️ Auto-claim error: {e}")
                                 click.echo(f"   💡 Please claim manually via Polymarket UI")
                         
-                        # Reset for new market
-                        order_placed = False
-                        bought_token = None
-                        entry_price = None
-                        entry_side = None
-                        current_slug = current_slug  # Already updated
+                    # Reset for new market
+                    order_placed = False
+                    bought_token = None
+                    entry_price = None
+                    entry_side = None
+                    entry_market_slug = None
                 
                 # Get token IDs and prices
                 if not use_gamma_prices:
@@ -1051,12 +1274,17 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss):
                     use_gamma_prices = False
                 
                 # Get title (if not set from gamma)
-                # Get title (if not set from gamma)
                 if not title:
-                    title_match = re.search(r'"title"\s*:\s*"([^"]+)', html)
+                    title_match = re.search(r'"title"\s*:\s*"([^"]+)', html) if html else None
                     title = title_match.group(1) if title_match else current_slug
                 timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
-                
+
+                # Paper mode: save tick data
+                save_tick(current_slug, up_price, down_price, datetime.now(timezone.utc).isoformat())
+
+                # Log every tick to file (not console - too noisy)
+                bot_log(f"TICK {current_slug} | UP={up_price:.4f} DOWN={down_price:.4f} | up_dur={up_high_duration}s down_dur={down_high_duration}s | pos={'Y' if order_placed else 'N'}", echo=False)
+
                 # Check conditions
                 should_buy = False
                 buy_side = None
@@ -1079,7 +1307,7 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss):
                         down_high_duration += 2
                     else:
                         down_high_duration = 2
-                    if down_high_duration >= min_duration:
+                    if down_high_duration >= min_duration and not should_buy:
                         should_buy = True
                         buy_side = "DOWN"
                 else:
@@ -1095,84 +1323,58 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss):
                     
                     # FIRST: Check if we're still in the same market where we bought
                     if current_slug != entry_market_slug:
-                        # Market changed - reset position tracking (don't check stop loss on old market)
-                        click.echo(f"   🔄 Market changed from {entry_market_slug} to {current_slug} - resetting position")
-                        order_placed = False
-                        entry_price = None
-                        entry_side = None
-                        bought_token = None
-                        entry_market_slug = None
+                        # Market changed - skip stop loss check (resolution handler will clean up)
+                        pass
                     elif current_slug != last_displayed_slug:
                         # Market slug updated but same as entry - update display
                         last_displayed_slug = current_slug
                     else:
-                        # Check if market is already resolved (won or lost)
-                        market_result = subprocess.run(
-                            ['curl', '-s', f'https://polymarket.com/event/{current_slug}'],
-                            capture_output=True, text=True, timeout=30
-                        )
-                        html = market_result.stdout
-                        
-                        closed_match = re.search(r'"closed":(true|false)', html)
-                        price_match = re.search(r'"outcomePrices"\s*:\s*\[([^\]]+)\]', html)
-                        
-                        if closed_match and price_match:
-                            is_closed = closed_match.group(1) == 'true'
-                            prices = [p.strip().strip('"') for p in price_match.group(1).split(',')]
-                            
-                            if is_closed:
-                                # Market resolved - check outcome
-                                won = False
-                                if entry_side == "UP" and prices[0] == "1":
-                                    won = True
-                                elif entry_side == "DOWN" and prices[1] == "1":
-                                    won = True
-                                
-                                if won:
-                                    click.echo(f"   🎉 Market resolved: {entry_side} WON!")
+                        # Check stop loss on current price
+                        loss_pct = 0
+                        if entry_side == "UP":
+                            loss_pct = (entry_price - up_price) / entry_price * 100
+                        elif entry_side == "DOWN":
+                            loss_pct = (entry_price - down_price) / entry_price * 100
+
+                        if loss_pct >= stop_loss_percent:
+                            sl_active_duration += 1
+
+                            if sl_active_duration >= sl_min_duration:
+                                if paper:
+                                    # Paper mode: simulate stop-loss exit
+                                    sell_price = up_price if entry_side == "UP" else down_price
+                                    paper_close_trade(current_slug, sell_price, "stop_loss")
+                                    pnl = (sell_price - entry_price) * bet_size
+                                    bot_log(f"   📝 PAPER STOP LOSS: {loss_pct:.1f}% loss - {entry_side} sold @ ${sell_price:.3f} P&L: ${pnl:+.2f}")
+                                    order_placed = False
+                                    entry_price = None
+                                    entry_side = None
+                                    bought_token = None
+                                    entry_market_slug = None
+                                    sl_active_duration = 0
                                 else:
-                                    click.echo(f"   💸 Market resolved: We LOST")
-                                # Reset position
-                                order_placed = False
-                                entry_price = None
-                                entry_side = None
-                                bought_token = None
-                            else:
-                                # Market not resolved - check stop loss
-                                loss_pct = 0
-                                if entry_side == "UP":
-                                    loss_pct = (entry_price - up_price) / entry_price * 100
-                                elif entry_side == "DOWN":
-                                    loss_pct = (entry_price - down_price) / entry_price * 100
-                                
-                                if loss_pct >= stop_loss_percent:
-                                    # Stop loss triggered - check duration
-                                    sl_active_duration += 1
-                                    
-                                    if sl_active_duration >= sl_min_duration:
-                                        # ตรวจสอบก่อนว่ามี position จริงหรือไม่
-                                        has_pos, pos_size = has_filled_position(client, bought_token, bet_size)
-                                        
-                                        if not has_pos:
-                                            click.echo(f"   ⚠️ No filled position found - skipping stop loss sell")
-                                            order_placed = False
-                                            entry_price = None
-                                            entry_side = None
-                                            bought_token = None
-                                            sl_active_duration = 0
-                                        else:
-                                            click.echo(f"   🛑 STOP LOSS: {loss_pct:.1f}% loss for {sl_active_duration}s - Selling {entry_side} (position: {pos_size})!")
-                                        
+                                    # Live mode: check position and sell
+                                    has_pos, pos_size = has_filled_position(client, bought_token, bet_size)
+
+                                    if not has_pos:
+                                        click.echo(f"   ⚠️ No filled position found - skipping stop loss sell")
+                                        order_placed = False
+                                        entry_price = None
+                                        entry_side = None
+                                        bought_token = None
+                                        sl_active_duration = 0
+                                    else:
+                                        bot_log(f"   🛑 STOP LOSS: {loss_pct:.1f}% loss for {sl_active_duration}s - Selling {entry_side} (position: {pos_size})!")
+
                                         # Sell at market price (FOK)
                                         try:
                                             if entry_side == "UP":
-                                                sell_token = token_ids[0]  # UP token
+                                                sell_token = token_ids[0]
                                                 sell_price = up_price
                                             else:
-                                                sell_token = token_ids[1]  # DOWN token
+                                                sell_token = token_ids[1]
                                                 sell_price = down_price
-                                            
-                                            # Create market order (FOK)
+
                                             from py_clob_client.clob_types import MarketOrderArgs
                                             order_args = MarketOrderArgs(
                                                 token_id=sell_token,
@@ -1182,28 +1384,24 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss):
                                                 order_type="FOK"
                                             )
                                             order_result = client.create_market_order(order_args)
-                                            
-                                            # Check result
+
                                             if order_result:
                                                 click.echo(f"   ✅ SOLD at market price: ${sell_price:.3f}")
                                             else:
                                                 click.echo(f"   ⚠️ Order result: {order_result}")
                                         except Exception as e:
                                             click.echo(f"   ❌ Sell failed: {e}")
-                                        
-                                        # Reset after stop loss
+
                                         order_placed = False
                                         entry_price = None
                                         entry_side = None
                                         bought_token = None
                                         sl_active_duration = 0
-                                    else:
-                                        # Still in grace period - just show warning
-                                        if sl_active_duration == 1:
-                                            click.echo(f"   ⚠️ STOP LOSS WARNING: {loss_pct:.1f}% loss - monitoring ({sl_active_duration}/{sl_min_duration}s)")
-                                else:
-                                    # Reset duration if not in stop loss zone
-                                    sl_active_duration = 0
+                            else:
+                                if sl_active_duration == 1:
+                                    bot_log(f"   ⚠️ STOP LOSS WARNING: {loss_pct:.1f}% loss - monitoring ({sl_active_duration}/{sl_min_duration}s)")
+                        else:
+                            sl_active_duration = 0
                 
                 # Display
                 status = ""
@@ -1212,10 +1410,11 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss):
                 elif buy_side == "DOWN" and not order_placed:
                     status = "🔔 DOWN signal!"
                 
-                # When market changes, reset status
+                # When market changes, reset status and title
                 if current_slug != last_displayed_slug:
                     last_displayed_slug = current_slug
-                    status = ""  # Reset status when market changes
+                    status = ""
+                    title = ""
                 
                 click.echo(f"[{timestamp}] {title}")
                 click.echo(f"   Up: ${up_price:.3f}  |  Down: ${down_price:.3f} {status}")
@@ -1225,73 +1424,172 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss):
                 
                 # Place order if conditions met (but not if market about to end)
                 if should_buy and buy_side and not order_placed:
+                    bot_log(f"   🎯 SIGNAL: {buy_side} > ${bid_price} for {up_high_duration if buy_side=='UP' else down_high_duration}s | time_left={time_remaining}s")
                     # Skip if market ending soon
                     if time_remaining <= time_buffer:
-                        click.echo(f"   ⏭️ Skipping - market ends in {time_remaining}s (< {time_buffer}s)")
+                        bot_log(f"   ⏭️ Skipping - market ends in {time_remaining}s (< {time_buffer}s)")
                         should_buy = False
-                    
+
                     if not should_buy:
                         continue
-                    
-                    try:
+
+                    if paper:
+                        # Paper trading: simulate the order
                         token_id = token_ids[0] if buy_side == "UP" else token_ids[1]
-                        side = BUY  # Always BUY - whether UP or DOWN
-                        
-                        order = OrderArgs(
-                            token_id=token_id,
-                            price=bid_price,
-                            size=bet_size,
-                            side=side
-                        )
-                        
-                        signed = client.create_order(order)
-                        result = client.post_order(signed, OrderType.GTC)
-                        
-                        if result.get('success'):
-                            # รอเช็คว่า order fill จริงหรือไม่ (รอสักครู่)
-                            time.sleep(2)
-                            
-                            # ตรวจสอบว่า order fill แล้วหรือยัง
-                            has_pos, pos_size = has_filled_position(client, token_id, bet_size)
-                            
-                            if has_pos:
-                                order_placed = True
-                                bought_token = token_id
-                                # Record entry price for stop loss
-                                entry_price = bid_price
-                                entry_side = buy_side
-                                entry_market_slug = current_slug  # Track which market we bought in
-                                click.echo(f"   ✅ ORDER PLACED & FILLED: {buy_side} @ ${bid_price} (${bet_size}) [Size: {pos_size}]")
-                                click.echo(f"   📋 Order ID: {result.get('orderID', 'N/A')[:20]}...")
+                        order_placed = True
+                        bought_token = token_id
+                        entry_price = bid_price
+                        entry_side = buy_side
+                        entry_market_slug = current_slug
+                        paper_log_trade(current_slug, buy_side, bid_price, bet_size)
+                        bot_log(f"   📝 PAPER ORDER: {buy_side} @ ${bid_price} (${bet_size})")
+                    else:
+                        # Live trading: place real order
+                        try:
+                            token_id = token_ids[0] if buy_side == "UP" else token_ids[1]
+                            side = BUY  # Always BUY - whether UP or DOWN
+
+                            order = OrderArgs(
+                                token_id=token_id,
+                                price=bid_price,
+                                size=bet_size,
+                                side=side
+                            )
+
+                            signed = client.create_order(order)
+                            result = client.post_order(signed, OrderType.GTC)
+
+                            if result.get('success'):
+                                time.sleep(2)
+                                has_pos, pos_size = has_filled_position(client, token_id, bet_size)
+
+                                if has_pos:
+                                    order_placed = True
+                                    bought_token = token_id
+                                    entry_price = bid_price
+                                    entry_side = buy_side
+                                    entry_market_slug = current_slug
+                                    bot_log(f"   ✅ ORDER PLACED & FILLED: {buy_side} @ ${bid_price} (${bet_size}) [Size: {pos_size}]")
+                                    click.echo(f"   📋 Order ID: {result.get('orderID', 'N/A')[:20]}...")
+                                else:
+                                    order_placed = False
+                                    bought_token = None
+                                    entry_price = None
+                                    entry_side = None
+                                    click.echo(f"   ⚠️ Order placed but NOT FILLED - will retry on next signal")
                             else:
                                 order_placed = False
                                 bought_token = None
                                 entry_price = None
                                 entry_side = None
-                                click.echo(f"   ⚠️ Order placed but NOT FILLED - will retry on next signal")
-                        else:
-                            order_placed = False  # Reset if failed
-                            bought_token = None
-                            entry_price = None
-                            entry_side = None
-                            click.echo(f"   ❌ Order failed: {result.get('errorMsg', 'Unknown error')}")
-                            
-                    except Exception as e:
-                        click.echo(f"   ❌ Order error: {e}")
-                    
+                                bot_log(f"   ❌ Order failed: {result.get('errorMsg', 'Unknown error')}")
+
+                        except Exception as e:
+                            click.echo(f"   ❌ Order error: {e}")
+
                     # Reset after placing order
                     up_high_duration = 0
                     down_high_duration = 0
-                
+
                 time.sleep(2)
-                
+
         except KeyboardInterrupt:
-            click.echo("\n🛑 Stopped")
-            
+            # Flush any remaining tick data
+            if paper:
+                flush_ticks()
+                for trade in paper_trades:
+                    if trade["status"] == "open":
+                        bot_log(f"   ⏳ Open trade {trade['slug']} {trade['side']} - will be resolved when market closes")
+                print_paper_summary()
+            bot_log("\n🛑 Stopped")
+
     except ImportError:
         click.echo("❌ py-clob-client not installed. Run: pip install py-clob-client")
     except Exception as e:
-        click.echo(f"❌ Error: {e}")
+        if paper:
+            flush_ticks()
+            print_paper_summary()
+        bot_log(f"❌ Error: {e}")
+
+@cli.command()
+def paper_report():
+    """Show paper trading performance report"""
+    journal_file = Path(__file__).parent / "trades.json"
+    ticks_file = Path(__file__).parent / "backtest" / "ticks.json"
+
+    if not journal_file.exists():
+        click.echo("No trades.json found. Run 'btc-watch-order --paper' first.")
+        return
+
+    with open(journal_file, 'r') as f:
+        data = json.load(f)
+
+    trades = data.get("trades", [])
+    if not trades:
+        click.echo("No trades recorded yet.")
+        return
+
+    closed = [t for t in trades if t.get("status") == "closed"]
+    open_trades = [t for t in trades if t.get("status") == "open"]
+
+    click.echo(f"\n{'='*60}")
+    click.echo(f"PAPER TRADING REPORT")
+    click.echo(f"{'='*60}")
+    click.echo(f"Total trades: {len(trades)} (Closed: {len(closed)}, Open: {len(open_trades)})")
+
+    if closed:
+        wins = [t for t in closed if (t.get("pnl") or 0) > 0]
+        losses = [t for t in closed if (t.get("pnl") or 0) < 0]
+        total_pnl = sum(t.get("pnl", 0) for t in closed)
+        win_rate = len(wins) / len(closed) * 100 if closed else 0
+
+        click.echo(f"\nWins: {len(wins)}  |  Losses: {len(losses)}")
+        click.echo(f"Win Rate: {win_rate:.1f}%")
+        click.echo(f"Total P&L: ${total_pnl:+.2f}")
+
+        if wins:
+            click.echo(f"Avg Win: ${sum(t['pnl'] for t in wins)/len(wins):+.2f}")
+        if losses:
+            click.echo(f"Avg Loss: ${sum(t['pnl'] for t in losses)/len(losses):+.2f}")
+
+        # Max drawdown
+        peak = 0
+        max_dd = 0
+        running = 0
+        for t in closed:
+            running += t.get("pnl", 0)
+            if running > peak:
+                peak = running
+            dd = peak - running
+            if dd > max_dd:
+                max_dd = dd
+        click.echo(f"Max Drawdown: ${max_dd:.2f}")
+
+        # By side
+        click.echo(f"\nBy Side:")
+        for side in ["UP", "DOWN"]:
+            side_trades = [t for t in closed if t.get("side", "").upper() == side]
+            if side_trades:
+                s_wins = sum(1 for t in side_trades if (t.get("pnl") or 0) > 0)
+                s_pnl = sum(t.get("pnl", 0) for t in side_trades)
+                click.echo(f"  {side}: {len(side_trades)} trades, {s_wins} wins "
+                          f"({s_wins/len(side_trades)*100:.0f}%), P&L: ${s_pnl:+.2f}")
+
+        click.echo(f"\nRecent Trades:")
+        click.echo(f"  {'TIME':<20} {'SIDE':<5} {'ENTRY':>6} {'EXIT':>6} {'PNL':>8} {'REASON':<10}")
+        for t in closed[-15:]:
+            ts = t.get("timestamp", "")[:19]
+            result = "W" if (t.get("pnl") or 0) > 0 else "L"
+            click.echo(f"  {ts:<20} {result} {t.get('side','?'):<4} ${t.get('entry_price',0):.2f} "
+                      f"${t.get('exit_price',0):.2f} ${t.get('pnl',0):>+7.2f} "
+                      f"{t.get('exit_reason',''):<10}")
+
+    # Tick stats
+    if ticks_file.exists():
+        with open(ticks_file, 'r') as f:
+            ticks = json.load(f)
+        click.echo(f"\nTick data: {len(ticks)} data points collected")
+
 
 if __name__ == "__main__":
     cli()

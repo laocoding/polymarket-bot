@@ -1,0 +1,6 @@
+.idea
+.claude
+.venv
+logs
+config.json
+backtest/*.json
