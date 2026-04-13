@@ -464,7 +464,7 @@ def btc_price():
         current_ts = int(now.timestamp())
         
         # Get market page to find token IDs
-        result = subprocess.run(['curl', '-s', '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', '-H', 'Accept: text/html', 'https://polymarket.com/crypto'], capture_output=True, text=True, timeout=15)
+        result = subprocess.run(['curl', '-s', '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', '-H', 'Accept: text/html', 'https://polymarket.com/crypto'], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=15)
         html = result.stdout
         
         # Find all 5m timestamps
@@ -485,7 +485,7 @@ def btc_price():
             current_slug = f"btc-updown-5m-{unique_ts[-1]}"
         
         # Get token IDs from market page
-        result = subprocess.run(['curl', '-s', f'https://polymarket.com/event/{current_slug}'], capture_output=True, text=True, timeout=15)
+        result = subprocess.run(['curl', '-s', f'https://polymarket.com/event/{current_slug}'], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=15)
         html = result.stdout
         
         # Extract clobTokenIds
@@ -537,7 +537,7 @@ def btc_updown():
         current_ts = int(now.timestamp())
         
         # Get btc-updown page from crypto section
-        result = subprocess.run(['curl', '-s', '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', '-H', 'Accept: text/html', 'https://polymarket.com/crypto'], capture_output=True, text=True, timeout=15)
+        result = subprocess.run(['curl', '-s', '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', '-H', 'Accept: text/html', 'https://polymarket.com/crypto'], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=15)
         html = result.stdout
         
         # Find all 5m timestamps
@@ -558,7 +558,7 @@ def btc_updown():
             current_slug = f"btc-updown-5m-{unique_ts[-1]}"
         
         # Get token IDs
-        result = subprocess.run(['curl', '-s', f'https://polymarket.com/event/{current_slug}'], capture_output=True, text=True, timeout=15)
+        result = subprocess.run(['curl', '-s', f'https://polymarket.com/event/{current_slug}'], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=15)
         html = result.stdout
         
         clob_match = re.search(r'"clobTokenIds":\[([^\]]+)\]', html)
@@ -615,7 +615,7 @@ def btc_watch():
                 current_ts = int(now.timestamp())
                 
                 # Get timestamps from crypto page
-                result = subprocess.run(['curl', '-s', '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', '-H', 'Accept: text/html', 'https://polymarket.com/crypto'], capture_output=True, text=True, timeout=30)
+                result = subprocess.run(['curl', '-s', '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', '-H', 'Accept: text/html', 'https://polymarket.com/crypto'], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30)
                 html = result.stdout
                 
                 matches = re.findall(r'btc-updown-5m-(\d+)', html)
@@ -636,7 +636,7 @@ def btc_watch():
                     current_slug = f"btc-updown-5m-{unique_ts[-1]}"
                 
                 # Get token IDs
-                result = subprocess.run(['curl', '-s', f'https://polymarket.com/event/{current_slug}'], capture_output=True, text=True, timeout=30)
+                result = subprocess.run(['curl', '-s', f'https://polymarket.com/event/{current_slug}'], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30)
                 html = result.stdout
                 
                 clob_match = re.search(r'"clobTokenIds":\[([^\]]+)\]', html)
@@ -943,7 +943,7 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
         
         result = subprocess.run(['curl', '-s', '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', 
                      '-H', 'Accept: text/html', 
-                     f'https://polymarket.com/event/{current_slug}'], capture_output=True, text=True, timeout=15)
+                     f'https://polymarket.com/event/{current_slug}'], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=15)
         
         # Check for Vercel checkpoint
         if 'checkpoint' in result.stdout.lower() or 'vercel' in result.stdout.lower():
@@ -994,11 +994,11 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                      '-H', 'Connection: keep-alive',
                      '-H', 'Upgrade-Insecure-Requests: 1',
                      f'https://polymarket.com/event/{current_slug}'],
-                    capture_output=True, text=True, timeout=30
+                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30
                 )
                 
                 # If website returns checkpoint, try Gamma API as fallback
-                use_clob_fallback = 'checkpoint' in result.stdout.lower() or 'vercel' in result.stdout.lower()
+                use_clob_fallback = result is None or 'checkpoint' in result.stdout.lower() or 'vercel' in result.stdout.lower()
                 
                 if use_clob_fallback:
                     # Fallback: use Gamma API by slug
@@ -1250,7 +1250,7 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                 
                 # Get token IDs and prices
                 if not use_gamma_prices:
-                    result = subprocess.run(['curl', '-s', f'https://polymarket.com/event/{current_slug}'], capture_output=True, text=True, timeout=30)
+                    result = subprocess.run(['curl', '-s', f'https://polymarket.com/event/{current_slug}'], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30)
                     html = result.stdout
                     
                     clob_match = re.search(r'"clobTokenIds":\[([^\]]+)\]', html)
