@@ -752,6 +752,95 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
     paper_ticks_file = Path(__file__).parent / "backtest" / "ticks.json"
     paper_journal_file = Path(__file__).parent / "trades.json"
 
+    # Live trading journal
+    live_journal_file = Path(__file__).parent / "trades.live.json"
+    live_trades = []
+
+    def _load_live_next_id():
+        if live_journal_file.exists():
+            try:
+                with open(live_journal_file, 'r') as f:
+                    data = json.load(f)
+                    ids = [t.get("id", 0) for t in data.get("trades", [])]
+                    return max(ids) + 1 if ids else 1
+            except (json.JSONDecodeError, IOError):
+                pass
+        return 1
+
+    live_next_id = _load_live_next_id()
+
+    def live_log_trade(slug, side, entry_price, bet_size, token_id=None, order_id=None, filled_size=None):
+        """Log a live trade entry."""
+        nonlocal live_next_id
+        cost = round(entry_price * bet_size, 2)
+        trade = {
+            "id": live_next_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "slug": slug,
+            "side": side,
+            "entry_price": entry_price,
+            "bet_size": bet_size,
+            "cost": cost,
+            "token_id": token_id,
+            "order_id": order_id,
+            "filled_size": filled_size,
+            "status": "open",
+            "exit_price": None,
+            "exit_timestamp": None,
+            "pnl": None,
+            "exit_reason": None,
+            "mode": "live",
+        }
+        live_trades.append(trade)
+        live_next_id += 1
+        save_live_journal()
+        return trade["id"]
+
+    def live_close_trade(slug, exit_price, exit_reason="resolved"):
+        """Close a live trade."""
+        for trade in reversed(live_trades):
+            if trade["slug"] == slug and trade["status"] == "open":
+                trade["status"] = "closed"
+                trade["exit_price"] = exit_price
+                trade["exit_reason"] = exit_reason
+                trade["exit_timestamp"] = datetime.now(timezone.utc).isoformat()
+                if exit_price >= 0.99:  # Won
+                    trade["pnl"] = round((1.0 - trade["entry_price"]) * trade["bet_size"], 2)
+                elif exit_price <= 0.01:  # Lost
+                    trade["pnl"] = round(-trade["entry_price"] * trade["bet_size"], 2)
+                else:  # Stop-loss / partial
+                    trade["pnl"] = round((exit_price - trade["entry_price"]) * trade["bet_size"], 2)
+                save_live_journal()
+                return trade
+        return None
+
+    def live_cancel_trade(slug, reason="unfilled"):
+        """Cancel an unfilled live trade."""
+        for trade in reversed(live_trades):
+            if trade["slug"] == slug and trade["status"] == "open":
+                trade["status"] = "canceled"
+                trade["exit_reason"] = reason
+                trade["exit_timestamp"] = datetime.now(timezone.utc).isoformat()
+                trade["pnl"] = 0
+                save_live_journal()
+                return trade
+        return None
+
+    def save_live_journal():
+        """Save live trades to journal file."""
+        existing_trades = []
+        current_ids = {t["id"] for t in live_trades}
+        if live_journal_file.exists():
+            try:
+                with open(live_journal_file, 'r') as f:
+                    data = json.load(f)
+                    existing_trades = [t for t in data.get("trades", []) if t.get("id") not in current_ids]
+            except (json.JSONDecodeError, IOError):
+                pass
+        all_trades = existing_trades + live_trades
+        with open(live_journal_file, 'w') as f:
+            json.dump({"trades": all_trades, "mode": "live"}, f, indent=2)
+
     def _query_gamma_markets(slug, closed=False):
         """Query Gamma /markets API. Returns (up_f, dn_f, is_resolved) or None."""
         import requests as _req
@@ -1543,12 +1632,14 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                             bot_log(f"   ℹ️ Trade already closed (stop-loss) for {last_displayed_slug}", echo=False)
                     else:
                         # Live mode: check unfilled orders
+                        live_was_filled = True
                         if order_placed and bought_token:
                             try:
                                 open_orders = client.get_orders()
                                 unfilled_orders = [o for o in open_orders if o.get('token_id') == bought_token]
 
                                 if unfilled_orders:
+                                    live_was_filled = False
                                     click.echo(f"⚠️ Found unfilled order, canceling...")
                                     for oo in unfilled_orders:
                                         order_id = oo.get('orderID')
@@ -1560,10 +1651,74 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                                                 click.echo(f"   ❌ Failed to cancel: {cancel_result.get('errorMsg', 'Unknown')}")
                                         except Exception as e:
                                             click.echo(f"   ❌ Cancel error: {e}")
+                                    live_cancel_trade(last_displayed_slug, "unfilled")
+                                    bot_log(f"   📋 Live journal: trade canceled (unfilled)")
                                 else:
                                     click.echo(f"   ✅ Order was filled (no open orders)")
                             except Exception as e:
                                 click.echo(f"⚠️ Check/cancel error: {e}")
+
+                        # Resolve filled live trade via Gamma API
+                        if order_placed and live_was_filled and resolve_side:
+                            gamma = _query_gamma_markets(last_displayed_slug, closed=True)
+                            if not gamma:
+                                gamma = _query_gamma_events(last_displayed_slug)
+                            if gamma:
+                                up_f, dn_f, is_resolved = gamma
+                                if is_resolved:
+                                    if resolve_side == "UP":
+                                        exit_price = up_f
+                                    else:
+                                        exit_price = dn_f
+                                    trade = live_close_trade(last_displayed_slug, exit_price, "resolved")
+                                    if trade:
+                                        bot_log(f"   📋 Live journal: {resolve_side} resolved @ ${exit_price:.2f}, P&L: ${trade['pnl']:+.2f}")
+                                else:
+                                    bot_log(f"   ⏳ Market not resolved yet, will resolve in background")
+                                    # Background resolver for live trade (same 3-phase logic as paper)
+                                    def _resolve_live_bg(slug, side):
+                                        import threading
+                                        def _check_and_close(data):
+                                            if not data:
+                                                return False
+                                            up_f, dn_f, is_r = data
+                                            winner = None
+                                            if up_f >= 0.99:
+                                                winner = "UP"
+                                            elif dn_f >= 0.99:
+                                                winner = "DOWN"
+                                            if winner and (is_r or up_f >= 0.99 or dn_f >= 0.99):
+                                                won = (side == winner)
+                                                ep = 1.0 if won else 0.0
+                                                t = live_close_trade(slug, ep, "resolved")
+                                                if t:
+                                                    bot_log(f"   📋 Live journal (bg): {side} {'WON' if won else 'LOST'} @ ${ep:.2f}, P&L: ${t['pnl']:+.2f}")
+                                                return True
+                                            return False
+                                        def _worker():
+                                            # Phase 1: /markets for 15 min (90 * 10s)
+                                            for _ in range(90):
+                                                data = _query_gamma_markets(slug, closed=False) or _query_gamma_markets(slug, closed=True)
+                                                if _check_and_close(data):
+                                                    return
+                                                time.sleep(10)
+                                            # Phase 2: /events for 5 min (30 * 10s)
+                                            for _ in range(30):
+                                                data = _query_gamma_events(slug)
+                                                if _check_and_close(data):
+                                                    return
+                                                time.sleep(10)
+                                            # Phase 3: /markets final for 5 min (30 * 10s)
+                                            for _ in range(30):
+                                                data = _query_gamma_markets(slug, closed=False) or _query_gamma_markets(slug, closed=True)
+                                                if _check_and_close(data):
+                                                    return
+                                                time.sleep(10)
+                                            # All phases exhausted (~25 min)
+                                            live_close_trade(slug, 0.5, "unresolved")
+                                            bot_log(f"   ⚠️ Live journal: {slug} unresolved after all retries")
+                                        threading.Thread(target=_worker, daemon=True).start()
+                                    _resolve_live_bg(last_displayed_slug, resolve_side)
 
                         # Check if we won (live mode auto-claim)
                         if auto_claim and not paper:
@@ -1791,6 +1946,7 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                                                 click.echo(f"   ✅ SOLD at market price: ${sell_price:.3f}")
                                                 sl_pnl = (sell_price - entry_price) * bet_size
                                                 tg.trade_closed_stop_loss(current_slug, entry_side, entry_price, sell_price, loss_pct, sl_pnl, "Live", bet_size=bet_size)
+                                                live_close_trade(current_slug, sell_price, "stop_loss")
                                             else:
                                                 click.echo(f"   ⚠️ Order result: {order_result}")
                                         except Exception as e:
@@ -1931,6 +2087,7 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                                     bot_log(f"   ✅ ORDER PLACED & FILLED: {buy_side} @ ${bid_price} (${bet_size}) [Size: {pos_size}]")
                                     click.echo(f"   📋 Order ID: {order_id[:20]}...")
                                     tg.trade_placed(None, current_slug, buy_side, bid_price, bet_size, time_remaining, "Live", order_id=order_id, filled_size=pos_size)
+                                    live_log_trade(current_slug, buy_side, bid_price, bet_size, token_id=token_id, order_id=order_id, filled_size=pos_size)
                                 else:
                                     order_placed = False
                                     bought_token = None
@@ -1961,6 +2118,11 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                     if trade["status"] == "open":
                         bot_log(f"   ⏳ Open trade {trade['slug']} {trade['side']} - will be resolved when market closes")
                 print_paper_summary()
+            else:
+                for trade in live_trades:
+                    if trade["status"] == "open":
+                        bot_log(f"   ⏳ Open live trade {trade['slug']} {trade['side']} - will need manual resolution")
+                save_live_journal()
             bot_log("\n🛑 Stopped")
 
     except ImportError:
@@ -1969,6 +2131,8 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
         if paper:
             flush_ticks()
             print_paper_summary()
+        else:
+            save_live_journal()
         bot_log(f"❌ Error: {e}")
 
 @cli.command()
