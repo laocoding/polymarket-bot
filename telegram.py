@@ -1,6 +1,7 @@
 """Telegram notification module for Polymarket bot."""
 
 import requests
+from datetime import datetime, timezone, timedelta
 
 
 class TelegramNotifier:
@@ -84,4 +85,51 @@ class TelegramNotifier:
         lines.append(f"Entry: ${entry_price:.3f} → Exit: ${exit_price:.3f}")
         lines.append(f"Loss: {loss_pct:.1f}%")
         lines.append(f"P&L: <b>${pnl:+.2f}</b>")
+        self.send("\n".join(lines))
+
+    def trade_summary(self, trades, period_label, bid_price=None):
+        """Build and send a trade summary for the given period."""
+        if not trades:
+            self.send(f"📊 <b>{period_label} Summary</b>\n\nNo trades in this period.")
+            return
+
+        closed = [t for t in trades if t["status"] == "closed"]
+        open_trades = [t for t in trades if t["status"] == "open"]
+        wins = [t for t in closed if (t.get("pnl") or 0) > 0]
+        losses = [t for t in closed if (t.get("pnl") or 0) < 0]
+        breakeven = [t for t in closed if (t.get("pnl") or 0) == 0]
+        total_pnl = sum(t.get("pnl", 0) for t in closed)
+        win_rate = len(wins) / len(closed) * 100 if closed else 0
+
+        lines = [f"📊 <b>{period_label} Summary</b>", ""]
+        lines.append(f"Total: {len(trades)} trades ({len(closed)} closed, {len(open_trades)} open)")
+        lines.append(f"Wins: {len(wins)} | Losses: {len(losses)} | Even: {len(breakeven)}")
+        lines.append(f"Win Rate: <b>{win_rate:.1f}%</b>")
+        lines.append(f"Total P&L: <b>${total_pnl:+.2f}</b>")
+
+        if wins:
+            avg_win = sum(t["pnl"] for t in wins) / len(wins)
+            lines.append(f"Avg Win: ${avg_win:+.2f}")
+        if losses:
+            avg_loss = sum(t["pnl"] for t in losses) / len(losses)
+            lines.append(f"Avg Loss: ${avg_loss:+.2f}")
+
+        if bid_price and closed:
+            breakeven_wr = bid_price * 100
+            edge = win_rate - breakeven_wr
+            edge_str = f"+{edge:.1f}% PROFITABLE" if edge > 0 else f"{edge:.1f}% NOT profitable"
+            lines.append(f"\nBreakeven WR: {breakeven_wr:.0f}% | Edge: {edge_str}")
+
+        # Last 5 trades
+        if closed:
+            lines.append("")
+            lines.append("Recent trades:")
+            for t in closed[-5:]:
+                result = "W" if (t.get("pnl") or 0) > 0 else "L"
+                lines.append(
+                    f"  #{t['id']} {result} {t['side']} "
+                    f"${t['entry_price']:.2f}→${t.get('exit_price', 0):.2f} "
+                    f"P&L ${t.get('pnl', 0):+.2f}"
+                )
+
         self.send("\n".join(lines))

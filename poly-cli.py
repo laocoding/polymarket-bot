@@ -740,6 +740,7 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
     # Paper trading: tick data and journal
     paper_tick_markets = {}  # slug -> {slug, start_ts, ticks, winner, resolved_at}
     paper_trades = []  # Simulated trades
+    resolving_slugs = set()  # slugs with active background resolver threads
     paper_ticks_file = Path(__file__).parent / "backtest" / "ticks.json"
     paper_journal_file = Path(__file__).parent / "trades.json"
 
@@ -932,6 +933,12 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
         """Resolve a paper trade in a background thread — does not block the main loop."""
         import threading
 
+        # Prevent duplicate resolvers for the same slug
+        if slug in resolving_slugs:
+            bot_log(f"   ℹ️ Resolver already running for {slug}, skipping", echo=False)
+            return
+        resolving_slugs.add(slug)
+
         def _check_winner(data):
             if not data:
                 return None
@@ -951,48 +958,53 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
             won = (resolve_side == winner)
             exit_price = 1.0 if won else 0.0
             trade = paper_close_trade(slug, exit_price, "resolved")
+            if trade is None:
+                # Already closed (stop-loss or duplicate resolver)
+                return
             pnl = ((1.0 - resolve_entry_price) if won else (-resolve_entry_price)) * bet_size
             result_emoji = "🎉 WON" if won else "💸 LOST"
             suffix = f" ({source_label})" if source_label else ""
             bot_log(f"   📝 PAPER RESULT [{slug}]{suffix}: {result_emoji} | {resolve_side} | P&L: ${pnl:+.2f}")
-            trade_id = trade["id"] if trade else "?"
-            tg.trade_closed_resolved(trade_id, slug, resolve_side, resolve_entry_price, exit_price, pnl, won, source_label)
+            tg.trade_closed_resolved(trade["id"], slug, resolve_side, resolve_entry_price, exit_price, pnl, won, source_label)
 
         def _resolve():
-            # Phase 1: try /markets for 15 minutes (90 * 10s)
-            for _retry in range(90):
-                data = _query_gamma_markets(slug, closed=False) or _query_gamma_markets(slug, closed=True)
-                winner = _check_winner(data)
-                if winner:
-                    _close_resolved(winner)
-                    return
-                time.sleep(10)
+            try:
+                # Phase 1: try /markets for 15 minutes (90 * 10s)
+                for _retry in range(90):
+                    data = _query_gamma_markets(slug, closed=False) or _query_gamma_markets(slug, closed=True)
+                    winner = _check_winner(data)
+                    if winner:
+                        _close_resolved(winner)
+                        return
+                    time.sleep(10)
 
-            # Phase 2: /markets failed — try /events for 5 minutes (30 * 10s)
-            bot_log(f"   🔄 /markets failed for {slug}, trying /events fallback...")
-            for _retry in range(30):
-                data = _query_gamma_events(slug)
-                winner = _check_winner(data)
-                if winner:
-                    _close_resolved(winner, "via events")
-                    return
-                time.sleep(10)
+                # Phase 2: /markets failed — try /events for 5 minutes (30 * 10s)
+                bot_log(f"   🔄 /markets failed for {slug}, trying /events fallback...")
+                for _retry in range(30):
+                    data = _query_gamma_events(slug)
+                    winner = _check_winner(data)
+                    if winner:
+                        _close_resolved(winner, "via events")
+                        return
+                    time.sleep(10)
 
-            # Phase 3: last attempt — /markets one more time (30 * 10s)
-            bot_log(f"   🔄 /events failed for {slug}, final /markets attempt...")
-            for _retry in range(30):
-                data = _query_gamma_markets(slug, closed=False) or _query_gamma_markets(slug, closed=True)
-                winner = _check_winner(data)
-                if winner:
-                    _close_resolved(winner, "final")
-                    return
-                time.sleep(10)
+                # Phase 3: last attempt — /markets one more time (30 * 10s)
+                bot_log(f"   🔄 /events failed for {slug}, final /markets attempt...")
+                for _retry in range(30):
+                    data = _query_gamma_markets(slug, closed=False) or _query_gamma_markets(slug, closed=True)
+                    winner = _check_winner(data)
+                    if winner:
+                        _close_resolved(winner, "final")
+                        return
+                    time.sleep(10)
 
-            # All phases exhausted (~25 min total) — close as unresolved
-            trade = paper_close_trade(slug, 0.5, "unresolved")
-            bot_log(f"   ⚠️ Could not resolve {slug} after all retries — closed as unresolved")
-            trade_id = trade["id"] if trade else "?"
-            tg.trade_closed_unresolved(trade_id, slug, resolve_side, resolve_entry_price)
+                # All phases exhausted (~25 min total) — close as unresolved
+                trade = paper_close_trade(slug, 0.5, "unresolved")
+                if trade:
+                    bot_log(f"   ⚠️ Could not resolve {slug} after all retries — closed as unresolved")
+                    tg.trade_closed_unresolved(trade["id"], slug, resolve_side, resolve_entry_price)
+            finally:
+                resolving_slugs.discard(slug)
 
         threading.Thread(target=_resolve, daemon=True).start()
 
@@ -1151,6 +1163,59 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
         bot_log(f"   Auto-claim: {'Enabled' if auto_claim else 'Disabled'}")
         bot_log(f"   Log file: {log_file}")
         click.echo("-" * 60)
+
+        # Background Telegram summary scheduler (4h + daily)
+        import threading
+
+        def _summary_scheduler():
+            """Send periodic trade summaries via Telegram."""
+            from datetime import timedelta
+            FOUR_HOURS = 4 * 3600
+            last_4h_send = time.time()
+            last_daily_date = datetime.now(timezone.utc).date()
+
+            def _load_all_trades():
+                """Load all trades from journal file + in-memory list."""
+                all_trades = list(paper_trades)
+                try:
+                    if paper_journal_file.exists():
+                        with open(paper_journal_file, 'r') as f:
+                            saved = json.load(f).get("trades", [])
+                        mem_ids = {t["id"] for t in all_trades}
+                        for t in saved:
+                            if t["id"] not in mem_ids:
+                                all_trades.append(t)
+                except Exception:
+                    pass
+                return all_trades
+
+            while True:
+                time.sleep(60)  # check every minute
+                now = time.time()
+                now_utc = datetime.now(timezone.utc)
+
+                # --- 4-hour summary ---
+                if now - last_4h_send >= FOUR_HOURS:
+                    last_4h_send = now
+                    cutoff_iso = (now_utc - timedelta(hours=4)).isoformat()
+                    all_trades = _load_all_trades()
+                    recent = [t for t in all_trades if t.get("timestamp", "") >= cutoff_iso]
+                    tg.trade_summary(recent, "4-Hour", bid_price=bid_price)
+                    bot_log("📊 Sent 4-hour Telegram summary", echo=False)
+
+                # --- Daily summary at midnight UTC ---
+                today = now_utc.date()
+                if today != last_daily_date:
+                    yesterday = last_daily_date
+                    last_daily_date = today
+                    yesterday_str = yesterday.isoformat()
+                    all_trades = _load_all_trades()
+                    day_trades = [t for t in all_trades if t.get("timestamp", "")[:10] == yesterday_str]
+                    tg.trade_summary(day_trades, f"Daily ({yesterday_str})", bid_price=bid_price)
+                    bot_log(f"📊 Sent daily Telegram summary for {yesterday_str}", echo=False)
+
+        threading.Thread(target=_summary_scheduler, daemon=True).start()
+        bot_log("📊 Telegram summary scheduler started (4h + daily)", echo=False)
 
         # Kick off background resolvers for orphaned open trades from previous sessions
         _now_ts = int(datetime.now(timezone.utc).timestamp())
