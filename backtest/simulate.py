@@ -49,24 +49,16 @@ def simulate_ticks(markets_dict, bid_prices, min_durations, bet_size, stop_loss_
                 winner = market["winner"]
                 slug = market["slug"]
 
-                # Simulate the signal: track how long dominant side > bid_price
+                # Simulate the signal: track UP and DOWN independently (matches real bot)
                 bought_side = None
                 bought_price = None
-                above_start_time = None
-                above_side = None
+                up_above_since = None
+                down_above_since = None
 
                 for tick in ticks:
                     up = tick["up"]
                     down = tick["down"]
                     t = tick["t"]
-
-                    # Determine dominant side
-                    if up > down:
-                        dom_side = "Up"
-                        dom_price = up
-                    else:
-                        dom_side = "Down"
-                        dom_price = down
 
                     if bought_side:
                         # Already bought — check stop-loss
@@ -85,20 +77,31 @@ def simulate_ticks(markets_dict, bid_prices, min_durations, bet_size, stop_loss_
                             break
                         continue
 
-                    # Check if dominant side price exceeds threshold
-                    if dom_price >= bp:
-                        if above_side == dom_side and above_start_time is not None:
-                            duration = t - above_start_time
-                            if duration >= md:
-                                # Signal triggered — buy at fixed limit price (matches real bot)
-                                bought_side = dom_side
-                                bought_price = bp
-                        else:
-                            above_side = dom_side
-                            above_start_time = t
+                    # Track UP and DOWN independently
+                    should_buy = False
+                    buy_side = None
+
+                    if up > bp:
+                        if up_above_since is None:
+                            up_above_since = t
+                        if t - up_above_since >= md:
+                            should_buy = True
+                            buy_side = "Up"
                     else:
-                        above_side = None
-                        above_start_time = None
+                        up_above_since = None
+
+                    if down > bp:
+                        if down_above_since is None:
+                            down_above_since = t
+                        if t - down_above_since >= md and not should_buy:
+                            should_buy = True
+                            buy_side = "Down"
+                    else:
+                        down_above_since = None
+
+                    if should_buy and buy_side:
+                        bought_side = buy_side
+                        bought_price = bp
 
                 # Market resolved — close the position
                 if bought_side:

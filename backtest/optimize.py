@@ -48,8 +48,8 @@ def simulate(markets, bp, md, bet_size, stop_loss_pct, min_time_left):
 
         bought_side = None
         bought_price = None
-        above_start_time = None
-        above_side = None
+        up_above_since = None
+        down_above_since = None
 
         for tick in ticks:
             up = tick["up"]
@@ -81,28 +81,34 @@ def simulate(markets, bp, md, bet_size, stop_loss_pct, min_time_left):
             if time_remaining < min_time_left:
                 continue
 
-            # Determine dominant side
-            if up > down:
-                dom_side = "Up"
-                dom_price = up
-            else:
-                dom_side = "Down"
-                dom_price = down
+            # Track UP and DOWN independently (matches real bot logic)
+            should_buy = False
+            buy_side = None
 
-            # Check threshold
-            if dom_price >= bp:
-                if above_side == dom_side and above_start_time is not None:
-                    duration = t - above_start_time
-                    if duration >= md:
-                        bought_side = dom_side
-                        bought_price = bp  # fixed limit price, matching real bot
-                        entry_time_left = time_remaining
-                else:
-                    above_side = dom_side
-                    above_start_time = t
+            # Up price > bid_price for min_duration seconds
+            if up > bp:
+                if up_above_since is None:
+                    up_above_since = t
+                if t - up_above_since >= md:
+                    should_buy = True
+                    buy_side = "Up"
             else:
-                above_side = None
-                above_start_time = None
+                up_above_since = None
+
+            # Down price > bid_price for min_duration seconds
+            if down > bp:
+                if down_above_since is None:
+                    down_above_since = t
+                if t - down_above_since >= md and not should_buy:
+                    should_buy = True
+                    buy_side = "Down"
+            else:
+                down_above_since = None
+
+            if should_buy and buy_side:
+                bought_side = buy_side
+                bought_price = bp  # fixed limit price, matching real bot
+                entry_time_left = time_remaining
 
         # Market resolved — close position
         if bought_side:

@@ -1440,8 +1440,8 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
             click.echo(f"   ✅ Market data loaded ({len(result.stdout)} bytes)")
         
         # Initialize tracking variables
-        up_high_duration = 0
-        down_high_duration = 0
+        up_above_since = None   # timestamp when up first exceeded bid_price
+        down_above_since = None # timestamp when down first exceeded bid_price
         last_up_price = 0
         last_down_price = 0
         order_placed = False
@@ -1485,8 +1485,8 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                                 and not paper_tick_markets[last_displayed_slug].get("winner")):
                             resolve_tick_winner_background(last_displayed_slug)
                         last_displayed_slug = current_slug
-                        up_high_duration = 0
-                        down_high_duration = 0
+                        up_above_since = None
+                        down_above_since = None
                 
                 # Try to get market data from website
                 try:
@@ -1774,8 +1774,8 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                     entry_side = None
                     entry_market_slug = None
                     last_displayed_slug = current_slug
-                    up_high_duration = 0
-                    down_high_duration = 0
+                    up_above_since = None
+                    down_above_since = None
                     sl_active_duration = 0
                 
                 # Get token IDs and prices
@@ -1836,40 +1836,41 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                 # Paper mode: save tick data
                 save_tick(current_slug, up_price, down_price, current_ts)
 
-                # Log every tick to file (not console - too noisy)
-                okx_log = f"OKX={okx_signal[0]}{okx_signal[1]:+.4f}%" if okx_signal else ("OKX=warming" if okx_enabled else "OKX=off")
-                bot_log(f"TICK {current_slug} | UP={up_price:.4f} DOWN={down_price:.4f} | up_dur={up_high_duration}s down_dur={down_high_duration}s | {okx_log} | pos={'Y' if order_placed else 'N'}", echo=False)
-
-                # Check conditions
+                # Check conditions using real timestamps
                 should_buy = False
                 buy_side = None
-                
+                now_mono = time.time()
+
                 # Up price > bid_price for min_duration seconds
                 if up_price > bid_price:
-                    if last_up_price > bid_price:
-                        up_high_duration += 2
-                    else:
-                        up_high_duration = 2
+                    if up_above_since is None:
+                        up_above_since = now_mono
+                    up_high_duration = now_mono - up_above_since
                     if up_high_duration >= min_duration:
                         should_buy = True
                         buy_side = "UP"
                 else:
+                    up_above_since = None
                     up_high_duration = 0
-                
+
                 # Down price > bid_price for min_duration seconds
                 if down_price > bid_price:
-                    if last_down_price > bid_price:
-                        down_high_duration += 2
-                    else:
-                        down_high_duration = 2
+                    if down_above_since is None:
+                        down_above_since = now_mono
+                    down_high_duration = now_mono - down_above_since
                     if down_high_duration >= min_duration and not should_buy:
                         should_buy = True
                         buy_side = "DOWN"
                 else:
+                    down_above_since = None
                     down_high_duration = 0
-                
+
                 last_up_price = up_price
                 last_down_price = down_price
+
+                # Log every tick to file (not console - too noisy)
+                okx_log = f"OKX={okx_signal[0]}{okx_signal[1]:+.4f}%" if okx_signal else ("OKX=warming" if okx_enabled else "OKX=off")
+                bot_log(f"TICK {current_slug} | UP={up_price:.4f} DOWN={down_price:.4f} | up_dur={up_high_duration:.0f}s down_dur={down_high_duration:.0f}s | {okx_log} | pos={'Y' if order_placed else 'N'}", echo=False)
                 
                 # Check stop loss if we have a real position (bought_token) AND same market
                 # Only check if we're in the same market where we bought
@@ -1984,7 +1985,7 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                 
                 # Place order if conditions met (but not if market about to end)
                 if should_buy and buy_side and not order_placed and current_slug not in traded_slugs:
-                    signal_duration = up_high_duration if buy_side == 'UP' else down_high_duration
+                    signal_duration = int(up_high_duration if buy_side == 'UP' else down_high_duration)
 
                     # OKX momentum confirmation gate
                     okx_confirmed = True
@@ -2105,8 +2106,8 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                             click.echo(f"   ❌ Order error: {e}")
 
                     # Reset after placing order
-                    up_high_duration = 0
-                    down_high_duration = 0
+                    up_above_since = None
+                    down_above_since = None
 
                 time.sleep(2)
 
