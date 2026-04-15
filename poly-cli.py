@@ -914,7 +914,7 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
         import requests as _req
 
         def _resolve():
-            for _retry in range(12):
+            for _retry in range(24):
                 try:
                     resp = _req.get(
                         f'https://gamma-api.polymarket.com/markets?slug={slug}',
@@ -944,9 +944,9 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                 except Exception:
                     pass
                 time.sleep(10)
-            # Still unresolved after 2 minutes — close at 0.5
+            # Still unresolved after 4 minutes — close at 0.5
             paper_close_trade(slug, 0.5, "unresolved")
-            bot_log(f"   ⚠️ Could not resolve {slug} after 2min — closed as unresolved")
+            bot_log(f"   ⚠️ Could not resolve {slug} after 4min — closed as unresolved")
 
         threading.Thread(target=_resolve, daemon=True).start()
 
