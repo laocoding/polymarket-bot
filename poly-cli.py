@@ -965,7 +965,7 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
             result_emoji = "🎉 WON" if won else "💸 LOST"
             suffix = f" ({source_label})" if source_label else ""
             bot_log(f"   📝 PAPER RESULT [{slug}]{suffix}: {result_emoji} | {resolve_side} | P&L: ${pnl:+.2f}")
-            tg.trade_closed_resolved(trade["id"], slug, resolve_side, resolve_entry_price, exit_price, pnl, won, source_label)
+            tg.trade_closed_resolved(trade["id"], slug, resolve_side, resolve_entry_price, exit_price, pnl, won, bet_size=bet_size, suffix=source_label)
 
         def _resolve():
             try:
@@ -1010,6 +1010,7 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
 
     def paper_log_trade(slug, side, entry_price, bet_size, token_id=None):
         """Log a simulated trade."""
+        cost = round(entry_price * bet_size, 2)
         trade = {
             "id": paper_next_id + len(paper_trades),
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1017,12 +1018,14 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
             "side": side,
             "entry_price": entry_price,
             "bet_size": bet_size,
+            "cost": cost,
             "token_id": token_id,
             "order_id": None,
             "status": "open",
             "exit_price": None,
             "exit_timestamp": None,
             "pnl": None,
+            "revenue": None,
             "exit_reason": None,
             "mode": "paper",
         }
@@ -1038,6 +1041,7 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                 trade["exit_price"] = exit_price
                 trade["exit_reason"] = exit_reason
                 trade["exit_timestamp"] = datetime.now(timezone.utc).isoformat()
+                trade["revenue"] = round(exit_price * trade["bet_size"], 2)
                 if exit_price >= 0.99:  # Won
                     trade["pnl"] = round((1.0 - trade["entry_price"]) * trade["bet_size"], 2)
                 elif exit_price <= 0.01:  # Lost
@@ -1653,7 +1657,7 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                                     pnl = (sell_price - entry_price) * bet_size
                                     bot_log(f"   📝 PAPER STOP LOSS: {loss_pct:.1f}% loss - {entry_side} sold @ ${sell_price:.3f} P&L: ${pnl:+.2f}")
                                     sl_trade_id = sl_trade["id"] if sl_trade else "?"
-                                    tg.trade_closed_stop_loss(current_slug, entry_side, entry_price, sell_price, loss_pct, pnl, "Paper", trade_id=sl_trade_id)
+                                    tg.trade_closed_stop_loss(current_slug, entry_side, entry_price, sell_price, loss_pct, pnl, "Paper", trade_id=sl_trade_id, bet_size=bet_size)
                                     order_placed = False
                                     entry_price = None
                                     entry_side = None
@@ -1696,7 +1700,7 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                                             if order_result:
                                                 click.echo(f"   ✅ SOLD at market price: ${sell_price:.3f}")
                                                 sl_pnl = (sell_price - entry_price) * bet_size
-                                                tg.trade_closed_stop_loss(current_slug, entry_side, entry_price, sell_price, loss_pct, sl_pnl, "Live")
+                                                tg.trade_closed_stop_loss(current_slug, entry_side, entry_price, sell_price, loss_pct, sl_pnl, "Live", bet_size=bet_size)
                                             else:
                                                 click.echo(f"   ⚠️ Order result: {order_result}")
                                         except Exception as e:

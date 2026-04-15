@@ -49,26 +49,31 @@ class TelegramNotifier:
         lines.append(f"Market: <code>{slug}</code>")
         lines.append(f"Side: <b>{side}</b>")
         lines.append(f"Entry: ${entry_price:.3f}")
-        size_str = f"${bet_size:.2f}"
+        cost = entry_price * bet_size
+        lines.append(f"Cost: ${cost:.2f} ({bet_size:.1f} tokens)")
         if filled_size is not None:
-            size_str += f" (filled: {filled_size})"
-        lines.append(f"Size: {size_str}")
+            lines.append(f"Filled: {filled_size}")
         lines.append(f"Time left: {time_remaining}s")
         self.send("\n".join(lines))
 
-    def trade_closed_resolved(self, trade_id, slug, side, entry_price, exit_price, pnl, won, suffix=""):
+    def trade_closed_resolved(self, trade_id, slug, side, entry_price, exit_price, pnl, won, bet_size=None, suffix=""):
         emoji = "🎉" if won else "💸"
         result = "WON" if won else "LOST"
         reason = f"Resolved{f' ({suffix})' if suffix else ''}"
-        self.send(
-            f"{emoji} <b>Trade Closed</b> — {result}\n"
-            f"Trade ID: <b>#{trade_id}</b>\n"
-            f"Market: <code>{slug}</code>\n"
-            f"Side: <b>{side}</b>\n"
-            f"Entry: ${entry_price:.3f} → Exit: ${exit_price:.1f}\n"
-            f"P&L: <b>${pnl:+.2f}</b>\n"
-            f"Reason: {reason}"
-        )
+        lines = [
+            f"{emoji} <b>Trade Closed</b> — {result}",
+            f"Trade ID: <b>#{trade_id}</b>",
+            f"Market: <code>{slug}</code>",
+            f"Side: <b>{side}</b>",
+            f"Entry: ${entry_price:.3f} → Exit: ${exit_price:.1f}",
+        ]
+        if bet_size is not None:
+            cost = entry_price * bet_size
+            revenue = exit_price * bet_size
+            lines.append(f"Cost: ${cost:.2f} → Returned: ${revenue:.2f}")
+        lines.append(f"P&L: <b>${pnl:+.2f}</b>")
+        lines.append(f"Reason: {reason}")
+        self.send("\n".join(lines))
 
     def trade_closed_unresolved(self, trade_id, slug, side, entry_price):
         self.send(
@@ -80,13 +85,17 @@ class TelegramNotifier:
             f"Reason: Could not resolve after ~25 min"
         )
 
-    def trade_closed_stop_loss(self, slug, side, entry_price, exit_price, loss_pct, pnl, mode, trade_id=None):
+    def trade_closed_stop_loss(self, slug, side, entry_price, exit_price, loss_pct, pnl, mode, trade_id=None, bet_size=None):
         lines = [f"🛑 <b>Trade Closed</b> — Stop Loss ({mode})"]
         if trade_id:
             lines.append(f"Trade ID: <b>#{trade_id}</b>")
         lines.append(f"Market: <code>{slug}</code>")
         lines.append(f"Side: <b>{side}</b>")
         lines.append(f"Entry: ${entry_price:.3f} → Exit: ${exit_price:.3f}")
+        if bet_size is not None:
+            cost = entry_price * bet_size
+            revenue = exit_price * bet_size
+            lines.append(f"Cost: ${cost:.2f} → Returned: ${revenue:.2f}")
         lines.append(f"Loss: {loss_pct:.1f}%")
         lines.append(f"P&L: <b>${pnl:+.2f}</b>")
         self.send("\n".join(lines))
@@ -105,10 +114,14 @@ class TelegramNotifier:
         total_pnl = sum(t.get("pnl", 0) for t in closed)
         win_rate = len(wins) / len(closed) * 100 if closed else 0
 
+        total_cost = sum(t.get("cost", t.get("entry_price", 0) * t.get("bet_size", 0)) for t in closed)
+        total_revenue = sum(t.get("revenue", t.get("exit_price", 0) * t.get("bet_size", 0)) for t in closed)
+
         lines = [f"📊 <b>{period_label} Summary</b>", ""]
         lines.append(f"Total: {len(trades)} trades ({len(closed)} closed, {len(open_trades)} open)")
         lines.append(f"Wins: {len(wins)} | Losses: {len(losses)} | Even: {len(breakeven)}")
         lines.append(f"Win Rate: <b>{win_rate:.1f}%</b>")
+        lines.append(f"Invested: ${total_cost:.2f} → Returned: ${total_revenue:.2f}")
         lines.append(f"Total P&L: <b>${total_pnl:+.2f}</b>")
 
         if wins:
@@ -130,9 +143,11 @@ class TelegramNotifier:
             lines.append("Recent trades:")
             for t in closed[-5:]:
                 result = "W" if (t.get("pnl") or 0) > 0 else "L"
+                t_cost = t.get("cost", t.get("entry_price", 0) * t.get("bet_size", 0))
+                t_rev = t.get("revenue", t.get("exit_price", 0) * t.get("bet_size", 0))
                 lines.append(
                     f"  #{t['id']} {result} {t['side']} "
-                    f"${t['entry_price']:.2f}→${t.get('exit_price', 0):.2f} "
+                    f"${t_cost:.2f}→${t_rev:.2f} "
                     f"P&L ${t.get('pnl', 0):+.2f}"
                 )
 
