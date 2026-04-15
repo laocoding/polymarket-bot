@@ -721,6 +721,11 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
 
     # Load config for default values
     config = load_config()
+
+    # Telegram notification setup
+    from telegram import TelegramNotifier
+    tg = TelegramNotifier(config.get('telegram_bot_token', ''), config.get('telegram_chat_id', ''))
+
     btc_config = config.get('btc_watch_order', {})
 
     # Use command line args if provided, otherwise use config
@@ -941,18 +946,25 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                 return winner
             return None
 
+        def _close_resolved(winner, source_label=""):
+            """Close a resolved trade, log it, and send Telegram notification."""
+            won = (resolve_side == winner)
+            exit_price = 1.0 if won else 0.0
+            trade = paper_close_trade(slug, exit_price, "resolved")
+            pnl = ((1.0 - resolve_entry_price) if won else (-resolve_entry_price)) * bet_size
+            result_emoji = "🎉 WON" if won else "💸 LOST"
+            suffix = f" ({source_label})" if source_label else ""
+            bot_log(f"   📝 PAPER RESULT [{slug}]{suffix}: {result_emoji} | {resolve_side} | P&L: ${pnl:+.2f}")
+            trade_id = trade["id"] if trade else "?"
+            tg.trade_closed_resolved(trade_id, slug, resolve_side, resolve_entry_price, exit_price, pnl, won, source_label)
+
         def _resolve():
             # Phase 1: try /markets for 15 minutes (90 * 10s)
             for _retry in range(90):
                 data = _query_gamma_markets(slug, closed=False) or _query_gamma_markets(slug, closed=True)
                 winner = _check_winner(data)
                 if winner:
-                    won = (resolve_side == winner)
-                    exit_price = 1.0 if won else 0.0
-                    paper_close_trade(slug, exit_price, "resolved")
-                    pnl = ((1.0 - resolve_entry_price) if won else (-resolve_entry_price)) * bet_size
-                    result_emoji = "🎉 WON" if won else "💸 LOST"
-                    bot_log(f"   📝 PAPER RESULT [{slug}]: {result_emoji} | {resolve_side} | P&L: ${pnl:+.2f}")
+                    _close_resolved(winner)
                     return
                 time.sleep(10)
 
@@ -962,12 +974,7 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                 data = _query_gamma_events(slug)
                 winner = _check_winner(data)
                 if winner:
-                    won = (resolve_side == winner)
-                    exit_price = 1.0 if won else 0.0
-                    paper_close_trade(slug, exit_price, "resolved")
-                    pnl = ((1.0 - resolve_entry_price) if won else (-resolve_entry_price)) * bet_size
-                    result_emoji = "🎉 WON" if won else "💸 LOST"
-                    bot_log(f"   📝 PAPER RESULT [{slug}] (via events): {result_emoji} | {resolve_side} | P&L: ${pnl:+.2f}")
+                    _close_resolved(winner, "via events")
                     return
                 time.sleep(10)
 
@@ -977,18 +984,15 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                 data = _query_gamma_markets(slug, closed=False) or _query_gamma_markets(slug, closed=True)
                 winner = _check_winner(data)
                 if winner:
-                    won = (resolve_side == winner)
-                    exit_price = 1.0 if won else 0.0
-                    paper_close_trade(slug, exit_price, "resolved")
-                    pnl = ((1.0 - resolve_entry_price) if won else (-resolve_entry_price)) * bet_size
-                    result_emoji = "🎉 WON" if won else "💸 LOST"
-                    bot_log(f"   📝 PAPER RESULT [{slug}] (final): {result_emoji} | {resolve_side} | P&L: ${pnl:+.2f}")
+                    _close_resolved(winner, "final")
                     return
                 time.sleep(10)
 
             # All phases exhausted (~25 min total) — close as unresolved
-            paper_close_trade(slug, 0.5, "unresolved")
+            trade = paper_close_trade(slug, 0.5, "unresolved")
             bot_log(f"   ⚠️ Could not resolve {slug} after all retries — closed as unresolved")
+            trade_id = trade["id"] if trade else "?"
+            tg.trade_closed_unresolved(trade_id, slug, resolve_side, resolve_entry_price)
 
         threading.Thread(target=_resolve, daemon=True).start()
 
@@ -1573,9 +1577,11 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                                 if paper:
                                     # Paper mode: simulate stop-loss exit
                                     sell_price = up_price if entry_side == "UP" else down_price
-                                    paper_close_trade(current_slug, sell_price, "stop_loss")
+                                    sl_trade = paper_close_trade(current_slug, sell_price, "stop_loss")
                                     pnl = (sell_price - entry_price) * bet_size
                                     bot_log(f"   📝 PAPER STOP LOSS: {loss_pct:.1f}% loss - {entry_side} sold @ ${sell_price:.3f} P&L: ${pnl:+.2f}")
+                                    sl_trade_id = sl_trade["id"] if sl_trade else "?"
+                                    tg.trade_closed_stop_loss(current_slug, entry_side, entry_price, sell_price, loss_pct, pnl, "Paper", trade_id=sl_trade_id)
                                     order_placed = False
                                     entry_price = None
                                     entry_side = None
@@ -1617,6 +1623,8 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
 
                                             if order_result:
                                                 click.echo(f"   ✅ SOLD at market price: ${sell_price:.3f}")
+                                                sl_pnl = (sell_price - entry_price) * bet_size
+                                                tg.trade_closed_stop_loss(current_slug, entry_side, entry_price, sell_price, loss_pct, sl_pnl, "Live")
                                             else:
                                                 click.echo(f"   ⚠️ Order result: {order_result}")
                                         except Exception as e:
@@ -1654,7 +1662,9 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                 
                 # Place order if conditions met (but not if market about to end)
                 if should_buy and buy_side and not order_placed and current_slug not in traded_slugs:
-                    bot_log(f"   🎯 SIGNAL: {buy_side} > ${bid_price} for {up_high_duration if buy_side=='UP' else down_high_duration}s | time_left={time_remaining}s")
+                    signal_duration = up_high_duration if buy_side == 'UP' else down_high_duration
+                    bot_log(f"   🎯 SIGNAL: {buy_side} > ${bid_price} for {signal_duration}s | time_left={time_remaining}s")
+                    tg.signal_found(current_slug, buy_side, up_price, down_price, signal_duration, bid_price, time_remaining, "Paper" if paper else "Live")
                     # Skip if market ending soon
                     if time_remaining <= time_buffer:
                         bot_log(f"   ⏭️ Skipping - market ends in {time_remaining}s (< {time_buffer}s)")
@@ -1672,8 +1682,9 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                         entry_side = buy_side
                         entry_market_slug = current_slug
                         traded_slugs.add(current_slug)
-                        paper_log_trade(current_slug, buy_side, bid_price, bet_size, token_id=token_id)
+                        trade_id = paper_log_trade(current_slug, buy_side, bid_price, bet_size, token_id=token_id)
                         bot_log(f"   📝 PAPER ORDER: {buy_side} @ ${bid_price} (${bet_size})")
+                        tg.trade_placed(trade_id, current_slug, buy_side, bid_price, bet_size, time_remaining, "Paper")
                     else:
                         # Live trading: place real order
                         try:
@@ -1701,8 +1712,10 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                                     entry_side = buy_side
                                     entry_market_slug = current_slug
                                     traded_slugs.add(current_slug)
+                                    order_id = result.get('orderID', 'N/A')
                                     bot_log(f"   ✅ ORDER PLACED & FILLED: {buy_side} @ ${bid_price} (${bet_size}) [Size: {pos_size}]")
-                                    click.echo(f"   📋 Order ID: {result.get('orderID', 'N/A')[:20]}...")
+                                    click.echo(f"   📋 Order ID: {order_id[:20]}...")
+                                    tg.trade_placed(None, current_slug, buy_side, bid_price, bet_size, time_remaining, "Live", order_id=order_id, filled_size=pos_size)
                                 else:
                                     order_placed = False
                                     bought_token = None
