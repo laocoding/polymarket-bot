@@ -738,6 +738,43 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
     paper_ticks_file = Path(__file__).parent / "backtest" / "ticks.json"
     paper_journal_file = Path(__file__).parent / "trades.json"
 
+    def _query_gamma_markets(slug, closed=False):
+        """Query Gamma /markets API. Returns (up_f, dn_f, is_resolved) or None."""
+        import requests as _req
+        try:
+            url = f'https://gamma-api.polymarket.com/markets?slug={slug}'
+            if closed:
+                url += '&closed=true'
+            resp = _req.get(url, timeout=10)
+            if resp.status_code == 200 and resp.json():
+                mdata = resp.json()[0]
+                is_resolved = mdata.get('umaResolutionStatus') == 'resolved'
+                op_raw = mdata.get('outcomePrices', '[]')
+                op = json.loads(op_raw) if isinstance(op_raw, str) else op_raw
+                if len(op) >= 2:
+                    return float(op[0]), float(op[1]), is_resolved
+        except Exception:
+            pass
+        return None
+
+    def _query_gamma_events(slug):
+        """Query Gamma /events API (fallback). Returns (up_f, dn_f, is_resolved) or None."""
+        import requests as _req
+        try:
+            resp = _req.get(f'https://gamma-api.polymarket.com/events?slug={slug}', timeout=10)
+            if resp.status_code == 200 and resp.json():
+                markets = resp.json()[0].get('markets', [])
+                for m in markets:
+                    if m.get('slug') == slug:
+                        is_resolved = m.get('umaResolutionStatus') == 'resolved'
+                        op_raw = m.get('outcomePrices', '[]')
+                        op = json.loads(op_raw) if isinstance(op_raw, str) else op_raw
+                        if len(op) >= 2:
+                            return float(op[0]), float(op[1]), is_resolved
+        except Exception:
+            pass
+        return None
+
     # Load max existing trade ID and close stale open trades from previous sessions
     paper_next_id = 1
     if paper_journal_file.exists():
@@ -748,89 +785,20 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                 _ids = [t.get("id", 0) for t in _trades]
                 if _ids:
                     paper_next_id = max(_ids) + 1
-                # Close any orphaned open trades from previous sessions
-                # Try to resolve each one via Gamma API first
-                _changed = False
+                # Identify orphaned open trades — they'll be resolved in background after startup
                 _now_ts = int(datetime.now(timezone.utc).timestamp())
                 for t in _trades:
                     if t.get("status") != "open":
                         continue
                     slug = t.get("slug", "")
-
-                    # Extract market end timestamp from slug (e.g. btc-updown-5m-1776181800)
                     try:
                         _market_end_ts = int(slug.split("-")[-1])
                     except (ValueError, IndexError):
                         _market_end_ts = 0
-
-                    # If the market hasn't ended yet (+ 30s grace), leave it open for
-                    # the main loop to handle — don't force-close with a fake 0.5 exit
                     if _market_end_ts > 0 and _now_ts < _market_end_ts + 30:
                         click.echo(f"   ⏳ Orphan trade {t['id']} ({slug}) market still active, leaving open.")
-                        continue
-
-                    _resolved = False
-                    if slug:
-                        # Retry up to 12 times (60s total) for Gamma API to reflect resolution
-                        for _attempt in range(12):
-                            try:
-                                import requests as _req
-                                _resp = _req.get(
-                                    f'https://gamma-api.polymarket.com/markets?slug={slug}',
-                                    timeout=10
-                                )
-                                if _resp.status_code != 200:
-                                    click.echo(f"   ⚠️ Gamma API returned {_resp.status_code} for {slug}, retry {_attempt+1}/12...")
-                                    time.sleep(5)
-                                    continue
-                                _json = _resp.json()
-                                if not _json:
-                                    click.echo(f"   ⚠️ Gamma API returned empty list for {slug}, retry {_attempt+1}/12...")
-                                    time.sleep(5)
-                                    continue
-                                _mdata = _json[0]
-                                _is_resolved = _mdata.get('resolved', False)
-                                _op_raw = _mdata.get('outcomePrices', '[]')
-                                _op = json.loads(_op_raw) if isinstance(_op_raw, str) else _op_raw
-                                if len(_op) >= 2:
-                                    _up_f, _dn_f = float(_op[0]), float(_op[1])
-                                    click.echo(f"   🔍 Orphan {t['id']} prices: UP={_up_f} DOWN={_dn_f} resolved={_is_resolved}")
-                                    if _up_f >= 0.95:
-                                        _winner = "UP"
-                                    elif _dn_f >= 0.95:
-                                        _winner = "DOWN"
-                                    else:
-                                        _winner = None
-                                    if _winner and (_is_resolved or _up_f >= 0.99 or _dn_f >= 0.99):
-                                        _won = (t.get("side") == _winner)
-                                        _ep = t.get("entry_price", 0.5)
-                                        _bs = t.get("bet_size", 0)
-                                        t["status"] = "closed"
-                                        t["exit_price"] = 1.0 if _won else 0.0
-                                        t["exit_reason"] = "resolved"
-                                        t["pnl"] = round((1.0 - _ep) * _bs if _won else (-_ep * _bs), 2)
-                                        t["exit_timestamp"] = datetime.now(timezone.utc).isoformat()
-                                        _changed = True
-                                        _resolved = True
-                                        click.echo(f"   📋 Resolved orphan trade {t['id']} ({slug}): {'WON' if _won else 'LOST'} P&L=${t['pnl']:+.2f}")
-                                        break
-                                    else:
-                                        click.echo(f"   ⏳ Orphan {t['id']} not settled yet, retry {_attempt+1}/12...")
-                                        time.sleep(5)
-                            except Exception as _e:
-                                click.echo(f"   ⚠️ Gamma API error for {slug}: {_e}, retry {_attempt+1}/12...")
-                                time.sleep(5)
-                    if not _resolved:
-                        t["status"] = "closed"
-                        t["exit_reason"] = "unresolved"
-                        t["exit_price"] = 0.5
-                        t["pnl"] = round((0.5 - t.get("entry_price", 0.5)) * t.get("bet_size", 0), 2)
-                        t["exit_timestamp"] = datetime.now(timezone.utc).isoformat()
-                        _changed = True
-                        click.echo(f"   ⚠️ Orphan trade {t['id']} ({slug}) could not be resolved after retries - closed at 0.5")
-                if _changed:
-                    with open(paper_journal_file, 'w') as f:
-                        json.dump({"trades": _trades, "mode": "paper"}, f, indent=2)
+                    else:
+                        click.echo(f"   🔄 Orphan trade {t['id']} ({slug}) will be resolved in background...")
         except (json.JSONDecodeError, IOError):
             pass
 
@@ -911,35 +879,46 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
     def resolve_tick_winner_background(slug):
         """Resolve winner for a no-trade market in a background thread (backtest data)."""
         import threading
-        import requests as _req
+
+        def _set_tick_winner(winner_str):
+            if slug in paper_tick_markets:
+                paper_tick_markets[slug]["winner"] = winner_str
+                paper_tick_markets[slug]["resolved_at"] = int(datetime.now(timezone.utc).timestamp())
+                flush_ticks()
+
+        def _check_tick_data(data):
+            if not data:
+                return None
+            up_f, dn_f, _resolved = data
+            if up_f >= 0.99:
+                return "Up"
+            elif dn_f >= 0.99:
+                return "Down"
+            return None
 
         def _resolve():
+            # Phase 1: /markets for 4 minutes (24 * 10s)
             for _retry in range(24):
-                try:
-                    resp = _req.get(
-                        f'https://gamma-api.polymarket.com/markets?slug={slug}',
-                        timeout=10
-                    )
-                    if resp.status_code == 200 and resp.json():
-                        mdata = resp.json()[0]
-                        op_raw = mdata.get('outcomePrices', '[]')
-                        op = json.loads(op_raw) if isinstance(op_raw, str) else op_raw
-                        if len(op) >= 2:
-                            up_f, dn_f = float(op[0]), float(op[1])
-                            if up_f >= 0.99:
-                                if slug in paper_tick_markets:
-                                    paper_tick_markets[slug]["winner"] = "Up"
-                                    paper_tick_markets[slug]["resolved_at"] = int(datetime.now(timezone.utc).timestamp())
-                                    flush_ticks()
-                                return
-                            elif dn_f >= 0.99:
-                                if slug in paper_tick_markets:
-                                    paper_tick_markets[slug]["winner"] = "Down"
-                                    paper_tick_markets[slug]["resolved_at"] = int(datetime.now(timezone.utc).timestamp())
-                                    flush_ticks()
-                                return
-                except Exception:
-                    pass
+                winner = _check_tick_data(_query_gamma_markets(slug, closed=False) or _query_gamma_markets(slug, closed=True))
+                if winner:
+                    _set_tick_winner(winner)
+                    return
+                time.sleep(10)
+
+            # Phase 2: /events fallback for 3 minutes (18 * 10s)
+            for _retry in range(18):
+                winner = _check_tick_data(_query_gamma_events(slug))
+                if winner:
+                    _set_tick_winner(winner)
+                    return
+                time.sleep(10)
+
+            # Phase 3: /markets final attempt for 3 minutes (18 * 10s)
+            for _retry in range(18):
+                winner = _check_tick_data(_query_gamma_markets(slug, closed=False) or _query_gamma_markets(slug, closed=True))
+                if winner:
+                    _set_tick_winner(winner)
+                    return
                 time.sleep(10)
 
         threading.Thread(target=_resolve, daemon=True).start()
@@ -947,42 +926,69 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
     def resolve_trade_background(slug, resolve_side, resolve_entry_price):
         """Resolve a paper trade in a background thread — does not block the main loop."""
         import threading
-        import requests as _req
+
+        def _check_winner(data):
+            if not data:
+                return None
+            up_f, dn_f, is_resolved = data
+            if up_f >= 0.99:
+                winner = "UP"
+            elif dn_f >= 0.99:
+                winner = "DOWN"
+            else:
+                winner = None
+            if winner and (is_resolved or up_f >= 0.99 or dn_f >= 0.99):
+                return winner
+            return None
 
         def _resolve():
-            for _retry in range(24):
-                try:
-                    resp = _req.get(
-                        f'https://gamma-api.polymarket.com/markets?slug={slug}',
-                        timeout=10
-                    )
-                    if resp.status_code == 200 and resp.json():
-                        mdata = resp.json()[0]
-                        is_resolved = mdata.get('resolved', False)
-                        op_raw = mdata.get('outcomePrices', '[]')
-                        op = json.loads(op_raw) if isinstance(op_raw, str) else op_raw
-                        if len(op) >= 2:
-                            up_f, dn_f = float(op[0]), float(op[1])
-                            if up_f >= 0.95:
-                                winner = "UP"
-                            elif dn_f >= 0.95:
-                                winner = "DOWN"
-                            else:
-                                winner = None
-                            if winner and (is_resolved or up_f >= 0.99 or dn_f >= 0.99):
-                                won = (resolve_side == winner)
-                                exit_price = 1.0 if won else 0.0
-                                paper_close_trade(slug, exit_price, "resolved")
-                                pnl = ((1.0 - resolve_entry_price) if won else (-resolve_entry_price)) * bet_size
-                                result_emoji = "🎉 WON" if won else "💸 LOST"
-                                bot_log(f"   📝 PAPER RESULT [{slug}]: {result_emoji} | {resolve_side} | P&L: ${pnl:+.2f}")
-                                return
-                except Exception:
-                    pass
+            # Phase 1: try /markets for 15 minutes (90 * 10s)
+            for _retry in range(90):
+                data = _query_gamma_markets(slug, closed=False) or _query_gamma_markets(slug, closed=True)
+                winner = _check_winner(data)
+                if winner:
+                    won = (resolve_side == winner)
+                    exit_price = 1.0 if won else 0.0
+                    paper_close_trade(slug, exit_price, "resolved")
+                    pnl = ((1.0 - resolve_entry_price) if won else (-resolve_entry_price)) * bet_size
+                    result_emoji = "🎉 WON" if won else "💸 LOST"
+                    bot_log(f"   📝 PAPER RESULT [{slug}]: {result_emoji} | {resolve_side} | P&L: ${pnl:+.2f}")
+                    return
                 time.sleep(10)
-            # Still unresolved after 4 minutes — close at 0.5
+
+            # Phase 2: /markets failed — try /events for 5 minutes (30 * 10s)
+            bot_log(f"   🔄 /markets failed for {slug}, trying /events fallback...")
+            for _retry in range(30):
+                data = _query_gamma_events(slug)
+                winner = _check_winner(data)
+                if winner:
+                    won = (resolve_side == winner)
+                    exit_price = 1.0 if won else 0.0
+                    paper_close_trade(slug, exit_price, "resolved")
+                    pnl = ((1.0 - resolve_entry_price) if won else (-resolve_entry_price)) * bet_size
+                    result_emoji = "🎉 WON" if won else "💸 LOST"
+                    bot_log(f"   📝 PAPER RESULT [{slug}] (via events): {result_emoji} | {resolve_side} | P&L: ${pnl:+.2f}")
+                    return
+                time.sleep(10)
+
+            # Phase 3: last attempt — /markets one more time (30 * 10s)
+            bot_log(f"   🔄 /events failed for {slug}, final /markets attempt...")
+            for _retry in range(30):
+                data = _query_gamma_markets(slug, closed=False) or _query_gamma_markets(slug, closed=True)
+                winner = _check_winner(data)
+                if winner:
+                    won = (resolve_side == winner)
+                    exit_price = 1.0 if won else 0.0
+                    paper_close_trade(slug, exit_price, "resolved")
+                    pnl = ((1.0 - resolve_entry_price) if won else (-resolve_entry_price)) * bet_size
+                    result_emoji = "🎉 WON" if won else "💸 LOST"
+                    bot_log(f"   📝 PAPER RESULT [{slug}] (final): {result_emoji} | {resolve_side} | P&L: ${pnl:+.2f}")
+                    return
+                time.sleep(10)
+
+            # All phases exhausted (~25 min total) — close as unresolved
             paper_close_trade(slug, 0.5, "unresolved")
-            bot_log(f"   ⚠️ Could not resolve {slug} after 4min — closed as unresolved")
+            bot_log(f"   ⚠️ Could not resolve {slug} after all retries — closed as unresolved")
 
         threading.Thread(target=_resolve, daemon=True).start()
 
@@ -1141,6 +1147,20 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
         bot_log(f"   Auto-claim: {'Enabled' if auto_claim else 'Disabled'}")
         bot_log(f"   Log file: {log_file}")
         click.echo("-" * 60)
+
+        # Kick off background resolvers for orphaned open trades from previous sessions
+        _now_ts = int(datetime.now(timezone.utc).timestamp())
+        for _ot in list(paper_trades):
+            if _ot.get("status") != "open":
+                continue
+            _ot_slug = _ot.get("slug", "")
+            try:
+                _ot_end_ts = int(_ot_slug.split("-")[-1])
+            except (ValueError, IndexError):
+                _ot_end_ts = 0
+            if _ot_end_ts > 0 and _now_ts >= _ot_end_ts + 30:
+                bot_log(f"   🔄 Starting background resolver for orphan trade {_ot['id']} ({_ot_slug})")
+                resolve_trade_background(_ot_slug, _ot.get("side", "UP"), _ot.get("entry_price", 0.5))
         
         # Initialize client
         config = load_config()
