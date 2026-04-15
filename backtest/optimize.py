@@ -95,7 +95,7 @@ def simulate(markets, bp, md, bet_size, stop_loss_pct, min_time_left):
                     duration = t - above_start_time
                     if duration >= md:
                         bought_side = dom_side
-                        bought_price = dom_price
+                        bought_price = bp  # fixed limit price, matching real bot
                         entry_time_left = time_remaining
                 else:
                     above_side = dom_side

@@ -90,9 +90,9 @@ def simulate_ticks(markets_dict, bid_prices, min_durations, bet_size, stop_loss_
                         if above_side == dom_side and above_start_time is not None:
                             duration = t - above_start_time
                             if duration >= md:
-                                # Signal triggered — buy
+                                # Signal triggered — buy at fixed limit price (matches real bot)
                                 bought_side = dom_side
-                                bought_price = dom_price
+                                bought_price = bp
                         else:
                             above_side = dom_side
                             above_start_time = t
