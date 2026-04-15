@@ -1008,6 +1008,50 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
 
         threading.Thread(target=_resolve, daemon=True).start()
 
+    def resolve_blocked_trade(blocked_trade):
+        """Resolve a blocked trade in background to verify if OKX decision was correct."""
+        import threading
+
+        slug = blocked_trade["slug"]
+        side = blocked_trade["side"]
+        entry_price = blocked_trade["entry_price"]
+
+        def _resolve_blocked():
+            try:
+                for _retry in range(90):
+                    data = _query_gamma_markets(slug, closed=False) or _query_gamma_markets(slug, closed=True)
+                    if data:
+                        up_f, dn_f, is_resolved = data
+                        winner = None
+                        if up_f >= 0.99:
+                            winner = "UP"
+                        elif dn_f >= 0.99:
+                            winner = "DOWN"
+                        if winner:
+                            won = (side == winner)
+                            blocked_trade["exit_price"] = 1.0 if won else 0.0
+                            blocked_trade["pnl"] = round(((1.0 - entry_price) if won else (-entry_price)) * bet_size, 2)
+                            blocked_trade["exit_reason"] += f" | would_have_{'won' if won else 'lost'}"
+                            blocked_trade["exit_timestamp"] = datetime.now(timezone.utc).isoformat()
+                            save_journal()
+                            verdict = "WRONG (missed a win)" if won else "CORRECT (avoided a loss)"
+                            bot_log(f"   🔍 OKX block #{blocked_trade['id']} [{slug}]: wanted {side}, winner={winner} -> OKX was {verdict}")
+                            saved_or_lost = blocked_trade["pnl"]
+                            tg.send(
+                                f"🔍 <b>OKX Block Verdict</b>\n"
+                                f"Trade #{blocked_trade['id']}\n"
+                                f"Market: <code>{slug}</code>\n"
+                                f"Wanted: <b>{side}</b>, Winner: <b>{winner}</b>\n"
+                                f"Result: <b>{verdict}</b>\n"
+                                f"P&L avoided: ${saved_or_lost:+.2f}"
+                            )
+                            return
+                    time.sleep(10)
+            except Exception as e:
+                bot_log(f"   ⚠️ Blocked trade resolver error for {slug}: {e}", echo=False)
+
+        threading.Thread(target=_resolve_blocked, daemon=True).start()
+
     def paper_log_trade(slug, side, entry_price, bet_size, token_id=None):
         """Log a simulated trade."""
         cost = round(entry_price * bet_size, 2)
@@ -1157,6 +1201,15 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                 # ถ้าเช็คไม่ได้ ให้ถือว่ามี position (ปลอดภัย)
                 return True, float(bet_size)
         
+        # Initialize OKX data feed for BTC price signals
+        from okx_feed import OKXFeed
+        okx = OKXFeed()
+        try:
+            okx.fetch_klines(limit=60)
+            okx_status = f"OK ({len(okx.klines)} klines loaded)"
+        except Exception as e:
+            okx_status = f"WARN: {e} (will retry)"
+
         mode_label = "📝 PAPER MODE" if paper else "💰 LIVE MODE"
         bot_log(f"📊 Watching BTC Up/Down with auto-order... (Press Ctrl+C to stop)")
         bot_log(f"   Mode: {mode_label}")
@@ -1165,6 +1218,7 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
         sl_status = f"{stop_loss_percent}% (min duration: {sl_min_duration}s)" if stop_loss_percent > 0 else "disabled"
         bot_log(f"   Stop loss: {sl_status}")
         bot_log(f"   Auto-claim: {'Enabled' if auto_claim else 'Disabled'}")
+        bot_log(f"   OKX feed: {okx_status}")
         bot_log(f"   Log file: {log_file}")
         click.echo("-" * 60)
 
@@ -1589,11 +1643,35 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                     title = title_match.group(1) if title_match else current_slug
                 timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
 
+                # Fetch OKX BTC price data for signal confirmation
+                okx_signal = None
+                okx_label = ""
+                try:
+                    okx_tick = okx.fetch_ticker()
+                    okx_mom = okx.momentum(60)   # 60 ticks × 2s = 2min momentum (matches M5)
+                    okx_ema = okx.ema(5)         # 5 × 1m klines = 5min EMA (matches M5)
+
+                    if okx_mom:
+                        okx_signal = okx_mom  # (direction, pct_change)
+                        okx_label = f"OKX ${okx_tick['last']:,.0f} {okx_mom[0]}{okx_mom[1]:+.4f}%"
+                        if okx_ema:
+                            okx_label += f" ema={okx_ema[1]}"
+                    else:
+                        okx_label = f"OKX ${okx_tick['last']:,.0f} (warming up)"
+
+                    # Refresh klines every ~30s (every 15th tick at 2s interval)
+                    if len(okx.prices) % 15 == 0:
+                        okx.fetch_klines(limit=10)
+                except Exception as e:
+                    okx_label = f"OKX err:{e}"
+                    bot_log(f"   OKX feed error: {e}", echo=False)
+
                 # Paper mode: save tick data
                 save_tick(current_slug, up_price, down_price, current_ts)
 
                 # Log every tick to file (not console - too noisy)
-                bot_log(f"TICK {current_slug} | UP={up_price:.4f} DOWN={down_price:.4f} | up_dur={up_high_duration}s down_dur={down_high_duration}s | pos={'Y' if order_placed else 'N'}", echo=False)
+                okx_log = f"OKX={okx_signal[0]}{okx_signal[1]:+.4f}%" if okx_signal else "OKX=warming"
+                bot_log(f"TICK {current_slug} | UP={up_price:.4f} DOWN={down_price:.4f} | up_dur={up_high_duration}s down_dur={down_high_duration}s | {okx_log} | pos={'Y' if order_placed else 'N'}", echo=False)
 
                 # Check conditions
                 should_buy = False
@@ -1731,15 +1809,64 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                     title = ""
                 
                 click.echo(f"[{timestamp}] {title}")
-                click.echo(f"   Up: ${up_price:.3f}  |  Down: ${down_price:.3f} {status}")
-                
+                click.echo(f"   Up: ${up_price:.3f}  |  Down: ${down_price:.3f}  |  {okx_label} {status}")
+
                 # Calculate time remaining in current market
                 time_remaining = (base_ts + 300) - int(time.time())
                 
                 # Place order if conditions met (but not if market about to end)
                 if should_buy and buy_side and not order_placed and current_slug not in traded_slugs:
                     signal_duration = up_high_duration if buy_side == 'UP' else down_high_duration
-                    bot_log(f"   🎯 SIGNAL: {buy_side} > ${bid_price} for {signal_duration}s | time_left={time_remaining}s")
+
+                    # OKX momentum confirmation gate
+                    okx_confirmed = True
+                    if okx_signal:
+                        okx_dir, okx_pct = okx_signal
+                        # Block if OKX momentum contradicts the Polymarket signal
+                        if buy_side == "UP" and okx_dir == "DOWN" and okx_pct < -0.01:
+                            okx_confirmed = False
+                            bot_log(f"   ❌ OKX REJECT: want UP but BTC momentum DOWN ({okx_pct:+.4f}%)")
+                        elif buy_side == "DOWN" and okx_dir == "UP" and okx_pct > 0.01:
+                            okx_confirmed = False
+                            bot_log(f"   ❌ OKX REJECT: want DOWN but BTC momentum UP ({okx_pct:+.4f}%)")
+
+                    if not okx_confirmed:
+                        # Log blocked trade to trades.json for later analysis
+                        blocked_trade = {
+                            "id": paper_next_id + len(paper_trades),
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "slug": current_slug,
+                            "side": buy_side,
+                            "entry_price": bid_price,
+                            "bet_size": bet_size,
+                            "status": "blocked",
+                            "exit_price": None,
+                            "pnl": None,
+                            "exit_reason": f"okx_reject:{okx_dir}{okx_pct:+.4f}%",
+                            "mode": "paper" if paper else "live",
+                            "okx_momentum": okx_pct,
+                            "okx_direction": okx_dir,
+                        }
+                        paper_trades.append(blocked_trade)
+                        save_journal()
+                        # Notify via Telegram
+                        tg.send(
+                            f"❌ <b>OKX Blocked Trade</b>\n"
+                            f"Market: <code>{current_slug}</code>\n"
+                            f"Wanted: <b>{buy_side}</b> @ ${bid_price}\n"
+                            f"OKX: BTC momentum <b>{okx_dir} {okx_pct:+.4f}%</b>\n"
+                            f"Reason: contradicts {buy_side} signal\n"
+                            f"Time left: {time_remaining}s"
+                        )
+                        bot_log(f"   ⏳ Blocked trade logged (#{blocked_trade['id']})")
+                        # Resolve in background to verify OKX decision
+                        resolve_blocked_trade(blocked_trade)
+                        traded_slugs.add(current_slug)  # Don't retry this market
+                        time.sleep(2)
+                        continue
+
+                    okx_info = f"OKX={okx_signal[0]}{okx_signal[1]:+.4f}%" if okx_signal else "OKX=n/a"
+                    bot_log(f"   🎯 SIGNAL: {buy_side} > ${bid_price} for {signal_duration}s | time_left={time_remaining}s | {okx_info}")
                     tg.signal_found(current_slug, buy_side, up_price, down_price, signal_duration, bid_price, time_remaining, "Paper" if paper else "Live")
                     # Skip if market ending soon
                     if time_remaining <= time_buffer:
@@ -1904,6 +2031,37 @@ def paper_report():
             click.echo(f"  {ts:<20} {result} {t.get('side','?'):<4} ${t.get('entry_price',0):.2f} "
                       f"${t.get('exit_price',0):.2f} ${t.get('pnl',0):>+7.2f} "
                       f"{t.get('exit_reason',''):<10}")
+
+    # OKX blocked trades analysis
+    blocked = [t for t in trades if t.get("status") == "blocked"]
+    if blocked:
+        resolved_blocks = [t for t in blocked if t.get("exit_price") is not None]
+        would_won = [t for t in resolved_blocks if (t.get("pnl") or 0) > 0]
+        would_lost = [t for t in resolved_blocks if (t.get("pnl") or 0) <= 0]
+        pending = len(blocked) - len(resolved_blocks)
+
+        click.echo(f"\n{'='*60}")
+        click.echo(f"OKX BLOCKED TRADES: {len(blocked)}")
+        click.echo(f"{'='*60}")
+        if resolved_blocks:
+            saved_pnl = sum(t.get("pnl", 0) for t in would_lost)
+            missed_pnl = sum(t.get("pnl", 0) for t in would_won)
+            click.echo(f"  Correct blocks (avoided loss): {len(would_lost)}  saved: ${-saved_pnl:+.2f}")
+            click.echo(f"  Wrong blocks (missed win):     {len(would_won)}  missed: ${missed_pnl:+.2f}")
+            accuracy = len(would_lost) / len(resolved_blocks) * 100
+            click.echo(f"  OKX accuracy: {accuracy:.0f}%")
+        if pending:
+            click.echo(f"  Pending resolution: {pending}")
+
+        click.echo(f"\n  Blocked trades:")
+        click.echo(f"  {'TIME':<20} {'SIDE':<5} {'OKX':>12} {'VERDICT':<20}")
+        for t in blocked[-15:]:
+            ts = t.get("timestamp", "")[:19]
+            okx_m = f"{t.get('okx_direction','?')}{t.get('okx_momentum',0):+.4f}%"
+            verdict = "pending"
+            if t.get("exit_price") is not None:
+                verdict = "CORRECT (saved $)" if (t.get("pnl") or 0) <= 0 else "WRONG (missed $)"
+            click.echo(f"  {ts:<20} {t.get('side','?'):<5} {okx_m:>12} {verdict:<20}")
 
     # Tick stats
     if ticks_file.exists():
