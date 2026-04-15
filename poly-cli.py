@@ -908,6 +908,42 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
             json.dump(existing, f, indent=2)
         os.replace(tmp, str(paper_ticks_file))
 
+    def resolve_tick_winner_background(slug):
+        """Resolve winner for a no-trade market in a background thread (backtest data)."""
+        import threading
+        import requests as _req
+
+        def _resolve():
+            for _retry in range(24):
+                try:
+                    resp = _req.get(
+                        f'https://gamma-api.polymarket.com/markets?slug={slug}',
+                        timeout=10
+                    )
+                    if resp.status_code == 200 and resp.json():
+                        mdata = resp.json()[0]
+                        op_raw = mdata.get('outcomePrices', '[]')
+                        op = json.loads(op_raw) if isinstance(op_raw, str) else op_raw
+                        if len(op) >= 2:
+                            up_f, dn_f = float(op[0]), float(op[1])
+                            if up_f >= 0.99:
+                                if slug in paper_tick_markets:
+                                    paper_tick_markets[slug]["winner"] = "Up"
+                                    paper_tick_markets[slug]["resolved_at"] = int(datetime.now(timezone.utc).timestamp())
+                                    flush_ticks()
+                                return
+                            elif dn_f >= 0.99:
+                                if slug in paper_tick_markets:
+                                    paper_tick_markets[slug]["winner"] = "Down"
+                                    paper_tick_markets[slug]["resolved_at"] = int(datetime.now(timezone.utc).timestamp())
+                                    flush_ticks()
+                                return
+                except Exception:
+                    pass
+                time.sleep(10)
+
+        threading.Thread(target=_resolve, daemon=True).start()
+
     def resolve_trade_background(slug, resolve_side, resolve_entry_price):
         """Resolve a paper trade in a background thread — does not block the main loop."""
         import threading
@@ -1193,27 +1229,7 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                         # Paper mode: resolve winner for markets with no trade (backtest data completeness)
                         if (paper and last_displayed_slug in paper_tick_markets
                                 and not paper_tick_markets[last_displayed_slug].get("winner")):
-                            try:
-                                import requests as req
-                                _resp = req.get(
-                                    f'https://gamma-api.polymarket.com/markets?slug={last_displayed_slug}',
-                                    timeout=10
-                                )
-                                if _resp.status_code == 200 and _resp.json():
-                                    _mdata = _resp.json()[0]
-                                    _op_raw = _mdata.get('outcomePrices', '[]')
-                                    _op = json.loads(_op_raw) if isinstance(_op_raw, str) else _op_raw
-                                    if len(_op) >= 2:
-                                        _up_f, _dn_f = float(_op[0]), float(_op[1])
-                                        if _up_f >= 0.99:
-                                            paper_tick_markets[last_displayed_slug]["winner"] = "Up"
-                                            paper_tick_markets[last_displayed_slug]["resolved_at"] = current_ts
-                                        elif _dn_f >= 0.99:
-                                            paper_tick_markets[last_displayed_slug]["winner"] = "Down"
-                                            paper_tick_markets[last_displayed_slug]["resolved_at"] = current_ts
-                                        flush_ticks()
-                            except Exception:
-                                pass
+                            resolve_tick_winner_background(last_displayed_slug)
                         last_displayed_slug = current_slug
                         up_high_duration = 0
                         down_high_duration = 0
