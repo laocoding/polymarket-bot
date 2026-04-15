@@ -723,7 +723,7 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
     config = load_config()
 
     # Telegram notification setup
-    from telegram import TelegramNotifier
+    from telegram import TelegramNotifier, TelegramCommandHandler
     tg = TelegramNotifier(config.get('telegram_bot_token', ''), config.get('telegram_chat_id', ''))
 
     btc_config = config.get('btc_watch_order', {})
@@ -1216,6 +1216,13 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
 
         threading.Thread(target=_summary_scheduler, daemon=True).start()
         bot_log("📊 Telegram summary scheduler started (4h + daily)", echo=False)
+
+        # Start Telegram command listener (responds to /summary, /stats, /open, /help)
+        tg_cmd = TelegramCommandHandler(tg, paper_journal_file, bid_price=bid_price)
+        tg_cmd.set_live_trades(paper_trades)
+        tg_cmd.start()
+        if tg.enabled:
+            bot_log("🤖 Telegram command listener started", echo=False)
 
         # Kick off background resolvers for orphaned open trades from previous sessions
         _now_ts = int(datetime.now(timezone.utc).timestamp())

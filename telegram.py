@@ -1,7 +1,11 @@
 """Telegram notification module for Polymarket bot."""
 
 import requests
+import threading
+import time
+import json
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 
 class TelegramNotifier:
@@ -133,3 +137,99 @@ class TelegramNotifier:
                 )
 
         self.send("\n".join(lines))
+
+
+class TelegramCommandHandler:
+    """Listens for Telegram bot commands via long polling and responds."""
+
+    def __init__(self, notifier: TelegramNotifier, trades_file: Path, bid_price: float = 0.6):
+        self.notifier = notifier
+        self.trades_file = trades_file
+        self.bid_price = bid_price
+        self._offset = 0
+        self._running = False
+        self._thread = None
+        self._extra_trades = []  # in-memory trades not yet saved to file
+
+    def set_live_trades(self, trades_list):
+        """Point to the in-memory trades list for up-to-date data."""
+        self._extra_trades = trades_list
+
+    def _load_trades(self):
+        all_trades = list(self._extra_trades)
+        try:
+            if self.trades_file.exists():
+                with open(self.trades_file, 'r') as f:
+                    saved = json.load(f).get("trades", [])
+                mem_ids = {t["id"] for t in all_trades}
+                for t in saved:
+                    if t["id"] not in mem_ids:
+                        all_trades.append(t)
+        except Exception:
+            pass
+        return all_trades
+
+    def _handle_command(self, text):
+        text = text.strip().lower()
+        if text in ("/summary", "/today"):
+            today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            all_trades = self._load_trades()
+            today_trades = [t for t in all_trades if t.get("timestamp", "")[:10] == today_str]
+            self.notifier.trade_summary(today_trades, f"Today ({today_str})", bid_price=self.bid_price)
+        elif text == "/stats":
+            all_trades = self._load_trades()
+            self.notifier.trade_summary(all_trades, "All Time", bid_price=self.bid_price)
+        elif text == "/open":
+            all_trades = self._load_trades()
+            open_trades = [t for t in all_trades if t.get("status") == "open"]
+            if not open_trades:
+                self.notifier.send("No open trades.")
+            else:
+                lines = [f"📂 <b>Open Trades ({len(open_trades)})</b>", ""]
+                for t in open_trades:
+                    lines.append(
+                        f"  #{t['id']} {t['side']} <code>{t['slug']}</code> "
+                        f"@ ${t['entry_price']:.3f}"
+                    )
+                self.notifier.send("\n".join(lines))
+        elif text == "/help":
+            self.notifier.send(
+                "🤖 <b>Bot Commands</b>\n\n"
+                "/summary — Today's trade summary\n"
+                "/stats — All-time trade summary\n"
+                "/open — List open trades\n"
+                "/help — Show this help"
+            )
+
+    def _poll_loop(self):
+        url = f"https://api.telegram.org/bot{self.notifier.bot_token}/getUpdates"
+        while self._running:
+            try:
+                resp = requests.get(url, params={
+                    "offset": self._offset,
+                    "timeout": 30,
+                    "allowed_updates": '["message"]',
+                }, timeout=35)
+                if not resp.ok:
+                    time.sleep(5)
+                    continue
+                updates = resp.json().get("result", [])
+                for update in updates:
+                    self._offset = update["update_id"] + 1
+                    msg = update.get("message", {})
+                    chat_id = str(msg.get("chat", {}).get("id", ""))
+                    text = msg.get("text", "")
+                    if chat_id == self.notifier.chat_id and text.startswith("/"):
+                        self._handle_command(text)
+            except Exception:
+                time.sleep(5)
+
+    def start(self):
+        if not self.notifier.enabled:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
