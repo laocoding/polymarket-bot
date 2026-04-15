@@ -1495,11 +1495,11 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                 pause_config = btc_config.get('markets_before_pause', 5)
                 pause_duration = btc_config.get('pause_duration_seconds', 300)
                 
-                # Track market changes for pause
-                if last_displayed_slug and current_slug != last_displayed_slug:
+                # Track market changes for pause (disabled in paper mode for data collection)
+                if not paper and last_displayed_slug and current_slug != last_displayed_slug:
                     market_change_count = getattr(btc_watch_order, 'market_change_count', 0) + 1
                     btc_watch_order.market_change_count = market_change_count
-                    
+
                     # Check if we should pause
                     if market_change_count >= pause_config and not getattr(btc_watch_order, 'is_paused', False):
                         click.echo(f"\n⏸️ Pausing for {pause_duration}s after {pause_config} markets...")
