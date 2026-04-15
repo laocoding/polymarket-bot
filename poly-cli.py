@@ -320,16 +320,22 @@ def btc_setup():
                            type=float)
     
     # Auto claim
-    auto_claim = click.prompt("Auto Claim? (y/n)", 
+    auto_claim = click.prompt("Auto Claim? (y/n)",
                              default='y' if btc_config.get('auto_claim', False) else 'n')
     auto_claim = auto_claim.lower() in ['y', 'yes']
-    
+
+    # OKX feed
+    okx_enabled = click.prompt("OKX Momentum Gate? (y/n)",
+                               default='y' if btc_config.get('okx_enabled', False) else 'n')
+    okx_enabled = okx_enabled.lower() in ['y', 'yes']
+
     # Save
     config['btc_watch_order'] = {
         'bid_price': bid_price,
         'min_duration': min_duration,
         'bet_size': bet_size,
-        'auto_claim': auto_claim
+        'auto_claim': auto_claim,
+        'okx_enabled': okx_enabled
     }
     save_config(config)
     
@@ -338,6 +344,7 @@ def btc_setup():
     click.echo(f"   Min Duration: {min_duration}s")
     click.echo(f"   Bet Size: ${bet_size}")
     click.echo(f"   Auto Claim: {auto_claim}")
+    click.echo(f"   OKX Gate: {okx_enabled}")
 
 @cli.command()
 @click.argument('slug', required=False)
@@ -736,6 +743,7 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
     stop_loss_percent = stop_loss if stop_loss is not None else btc_config.get('stop_loss_percent', 0)
     sl_min_duration = config.get('sl_min_duration', 5)  # Read from root level
     time_buffer = btc_config.get('time_buffer', 15)
+    okx_enabled = btc_config.get('okx_enabled', False)
 
     # Paper trading: tick data and journal
     paper_tick_markets = {}  # slug -> {slug, start_ts, ticks, winner, resolved_at}
@@ -1202,13 +1210,16 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                 return True, float(bet_size)
         
         # Initialize OKX data feed for BTC price signals
-        from okx_feed import OKXFeed
-        okx = OKXFeed()
-        try:
-            okx.fetch_klines(limit=60)
-            okx_status = f"OK ({len(okx.klines)} klines loaded)"
-        except Exception as e:
-            okx_status = f"WARN: {e} (will retry)"
+        okx = None
+        okx_status = "disabled"
+        if okx_enabled:
+            from okx_feed import OKXFeed
+            okx = OKXFeed()
+            try:
+                okx.fetch_klines(limit=60)
+                okx_status = f"OK ({len(okx.klines)} klines loaded)"
+            except Exception as e:
+                okx_status = f"WARN: {e} (will retry)"
 
         mode_label = "📝 PAPER MODE" if paper else "💰 LIVE MODE"
         bot_log(f"📊 Watching BTC Up/Down with auto-order... (Press Ctrl+C to stop)")
@@ -1646,31 +1657,32 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                 # Fetch OKX BTC price data for signal confirmation
                 okx_signal = None
                 okx_label = ""
-                try:
-                    okx_tick = okx.fetch_ticker()
-                    okx_mom = okx.momentum(60)   # 60 ticks × 2s = 2min momentum (matches M5)
-                    okx_ema = okx.ema(5)         # 5 × 1m klines = 5min EMA (matches M5)
+                if okx_enabled and okx:
+                    try:
+                        okx_tick = okx.fetch_ticker()
+                        okx_mom = okx.momentum(60)   # 60 ticks × 2s = 2min momentum (matches M5)
+                        okx_ema = okx.ema(5)         # 5 × 1m klines = 5min EMA (matches M5)
 
-                    if okx_mom:
-                        okx_signal = okx_mom  # (direction, pct_change)
-                        okx_label = f"OKX ${okx_tick['last']:,.0f} {okx_mom[0]}{okx_mom[1]:+.4f}%"
-                        if okx_ema:
-                            okx_label += f" ema={okx_ema[1]}"
-                    else:
-                        okx_label = f"OKX ${okx_tick['last']:,.0f} (warming up)"
+                        if okx_mom:
+                            okx_signal = okx_mom  # (direction, pct_change)
+                            okx_label = f"OKX ${okx_tick['last']:,.0f} {okx_mom[0]}{okx_mom[1]:+.4f}%"
+                            if okx_ema:
+                                okx_label += f" ema={okx_ema[1]}"
+                        else:
+                            okx_label = f"OKX ${okx_tick['last']:,.0f} (warming up)"
 
-                    # Refresh klines every ~30s (every 15th tick at 2s interval)
-                    if len(okx.prices) % 15 == 0:
-                        okx.fetch_klines(limit=10)
-                except Exception as e:
-                    okx_label = f"OKX err:{e}"
-                    bot_log(f"   OKX feed error: {e}", echo=False)
+                        # Refresh klines every ~30s (every 15th tick at 2s interval)
+                        if len(okx.prices) % 15 == 0:
+                            okx.fetch_klines(limit=10)
+                    except Exception as e:
+                        okx_label = f"OKX err:{e}"
+                        bot_log(f"   OKX feed error: {e}", echo=False)
 
                 # Paper mode: save tick data
                 save_tick(current_slug, up_price, down_price, current_ts)
 
                 # Log every tick to file (not console - too noisy)
-                okx_log = f"OKX={okx_signal[0]}{okx_signal[1]:+.4f}%" if okx_signal else "OKX=warming"
+                okx_log = f"OKX={okx_signal[0]}{okx_signal[1]:+.4f}%" if okx_signal else ("OKX=warming" if okx_enabled else "OKX=off")
                 bot_log(f"TICK {current_slug} | UP={up_price:.4f} DOWN={down_price:.4f} | up_dur={up_high_duration}s down_dur={down_high_duration}s | {okx_log} | pos={'Y' if order_placed else 'N'}", echo=False)
 
                 # Check conditions
@@ -1865,7 +1877,7 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                         time.sleep(2)
                         continue
 
-                    okx_info = f"OKX={okx_signal[0]}{okx_signal[1]:+.4f}%" if okx_signal else "OKX=n/a"
+                    okx_info = f"OKX={okx_signal[0]}{okx_signal[1]:+.4f}%" if okx_signal else ("OKX=n/a" if okx_enabled else "OKX=off")
                     bot_log(f"   🎯 SIGNAL: {buy_side} > ${bid_price} for {signal_duration}s | time_left={time_remaining}s | {okx_info}")
                     tg.signal_found(current_slug, buy_side, up_price, down_price, signal_duration, bid_price, time_remaining, "Paper" if paper else "Live")
                     # Skip if market ending soon
