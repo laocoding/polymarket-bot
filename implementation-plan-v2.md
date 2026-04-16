@@ -11,6 +11,29 @@ This upgraded roadmap shifts the architecture from a reactive scraper to a predi
 2. **Polymarket ClobClient Upgrade:**
    * Replace all synchronous `curl` and `requests` calls with the Polymarket Python SDK's WebSocket client to monitor the 5m BTC Up/Down order books continuously without blocking the event loop.
 
+## Phase 1.5: Dominance Filter (Market Quality Gate)
+*Goal: Skip low-quality "coin-flip" markets where neither side has a clear price lead.*
+
+Backtest analysis (249 markets, bp=0.55, md=20) found that **dominance** — the average price difference between the bought side and the other side — is the single strongest predictor of trade outcome:
+
+| Filter | Trades | Win Rate | PnL |
+|--------|--------|----------|-----|
+| Baseline (no filter) | 249 | 67.5% | $62.10 |
+| Dominance >= 0.05 only | 194 | 84.0% | $112.60 |
+| Dominance < 0.05 (skipped) | 55 | 9.1% | -$50.50 |
+
+1. **Tick History Per Market:**
+   * Collect UP and DOWN prices in a list as ticks arrive for the current market. Clear on market change.
+2. **Dominance Check Before Buy:**
+   * When a buy signal fires, compute avg price of the signal side vs the other side over all observed ticks.
+   * If `avg_my_side - avg_other_side < dominance_threshold`, skip the trade.
+3. **Config:**
+   * Add `dominance_threshold` to `btc_watch_order` in config.json (default `0` = disabled, recommended `0.05`).
+4. **Logging:**
+   * Log dominance value on every signal (buy or skip) for ongoing data collection.
+
+**WARNING:** Based on only 249 markets. Collect 500+ before enabling. The filter looks strong but could be overfitted.
+
 ## Phase 2: Technical Analysis & Predictive Logic (VORLAVONG AI Engine)
 *Goal: Process OKX data to predict the Polymarket outcome before Polymarket liquidity providers adjust their prices.*
 
