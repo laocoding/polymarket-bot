@@ -706,7 +706,7 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
     # Setup file logging - one file per day, auto-rotates at midnight
     log_dir = Path(__file__).parent / "logs"
     log_dir.mkdir(exist_ok=True)
-    log_file = log_dir / f"bot_{datetime.now().strftime('%Y%m%d')}.log"
+    log_file = log_dir / "bot.log"
     bot_logger = logging.getLogger("bot")
     bot_logger.setLevel(logging.INFO)
     # Remove any stale handlers from previous runs
@@ -716,7 +716,8 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
         log_file, when="midnight", backupCount=30, encoding="utf-8"
     )
     file_handler.suffix = "%Y%m%d"
-    file_handler.namer = lambda name: str(log_dir / f"bot_{name.split('.')[-1]}.log")
+    # Rotated files: bot.log.20260415, bot.log.20260414, etc.
+    file_handler.namer = lambda name: str(log_dir / f"bot.log.{name.split('.')[-1]}")
     file_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
     bot_logger.addHandler(file_handler)
 
@@ -747,6 +748,7 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
 
     # Paper trading: tick data and journal
     paper_tick_markets = {}  # slug -> {slug, start_ts, ticks, winner, resolved_at}
+    paper_ticks_flushed = 0  # count of ticks already flushed and removed from memory
     paper_trades = []  # Simulated trades
     resolving_slugs = set()  # slugs with active background resolver threads
     paper_ticks_file = Path(__file__).parent / "backtest" / "ticks.json"
@@ -978,6 +980,12 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
         with open(tmp, 'w') as f:
             json.dump(existing, f, indent=2)
         os.replace(tmp, str(paper_ticks_file))
+        # Free memory: remove resolved markets already flushed to disk
+        nonlocal paper_ticks_flushed
+        resolved_slugs = [s for s, m in paper_tick_markets.items() if m.get("winner")]
+        for s in resolved_slugs:
+            paper_ticks_flushed += len(paper_tick_markets[s]["ticks"])
+            del paper_tick_markets[s]
 
     def resolve_tick_winner_background(slug):
         """Resolve winner for a no-trade market in a background thread (backtest data)."""
@@ -1230,7 +1238,7 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
         click.echo(f"📋 PAPER TRADING SUMMARY")
         click.echo(f"{'='*60}")
         click.echo(f"Total trades: {len(paper_trades)} (Closed: {len(closed)}, Open: {len(open_trades)})")
-        total_ticks = sum(len(m["ticks"]) for m in paper_tick_markets.values())
+        total_ticks = paper_ticks_flushed + sum(len(m["ticks"]) for m in paper_tick_markets.values())
         click.echo(f"Ticks collected: {total_ticks}")
 
         if closed:
@@ -1780,8 +1788,13 @@ def btc_watch_order(bid_price, min_duration, bet_size, auto_claim, stop_loss, pa
                 
                 # Get token IDs and prices
                 if not use_gamma_prices:
-                    result = subprocess.run(['curl', '-s', f'https://polymarket.com/event/{current_slug}'], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30)
-                    html = result.stdout
+                    try:
+                        result = subprocess.run(['curl', '-s', f'https://polymarket.com/event/{current_slug}'], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30)
+                        html = result.stdout
+                    except subprocess.TimeoutExpired:
+                        bot_log(f"⚠️ Curl timeout fetching {current_slug}, retrying next loop")
+                        time.sleep(2)
+                        continue
                     
                     clob_match = re.search(r'"clobTokenIds":\[([^\]]+)\]', html)
                     if not clob_match:

@@ -62,19 +62,20 @@ def simulate_ticks(markets_dict, bid_prices, min_durations, bet_size, stop_loss_
 
                     if bought_side:
                         # Already bought — check stop-loss
-                        current_price = up if bought_side == "Up" else down
-                        loss_pct = (bought_price - current_price) / bought_price * 100
-                        if loss_pct >= stop_loss_pct:
-                            trades.append({
-                                "slug": slug,
-                                "side": bought_side,
-                                "entry": bought_price,
-                                "exit": current_price,
-                                "pnl": (current_price - bought_price) * bet_size,
-                                "result": "stop_loss",
-                            })
-                            bought_side = None
-                            break
+                        if stop_loss_pct > 0:
+                            current_price = up if bought_side == "Up" else down
+                            loss_pct = (bought_price - current_price) / bought_price * 100
+                            if loss_pct >= stop_loss_pct:
+                                trades.append({
+                                    "slug": slug,
+                                    "side": bought_side,
+                                    "entry": bought_price,
+                                    "exit": current_price,
+                                    "pnl": (current_price - bought_price) * bet_size,
+                                    "result": "stop_loss",
+                                })
+                                bought_side = None
+                                break
                         continue
 
                     # Track UP and DOWN independently
